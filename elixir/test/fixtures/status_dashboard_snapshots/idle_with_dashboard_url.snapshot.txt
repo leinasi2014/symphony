@@ -1,19 +1,19 @@
 \e[1m╭─ SYMPHONY STATUS\e[0m
-\e[1m│ Agents: \e[0m\e[32m0\e[0m\e[90m/\e[0m\e[90m10\e[0m
-\e[1m│ Throughput: \e[0m\e[36m0 tps\e[0m
-\e[1m│ Runtime: \e[0m\e[35m0m 0s\e[0m
-\e[1m│ Tokens: \e[0m\e[33min 0\e[0m\e[90m | \e[0m\e[33mout 0\e[0m\e[90m | \e[0m\e[33mtotal 0\e[0m
-\e[1m│ Rate Limits: \e[0m\e[90munavailable\e[0m
-\e[1m│ Project: \e[0m\e[36mhttps://linear.app/project/project/issues\e[0m
-\e[1m│ Dashboard: \e[0m\e[36mhttp://127.0.0.1:4000/\e[0m
-\e[1m│ Next refresh: \e[0m\e[90mn/a\e[0m
-\e[1m├─ Running\e[0m
+\e[1m│ Agent 数: \e[0m\e[32m0\e[0m\e[90m/\e[0m\e[90m10\e[0m
+\e[1m│ 吞吐: \e[0m\e[36m0 tps\e[0m
+\e[1m│ 运行时长: \e[0m\e[35m0分 0秒\e[0m
+\e[1m│ 令牌: \e[0m\e[33m输入 0\e[0m\e[90m | \e[0m\e[33m输出 0\e[0m\e[90m | \e[0m\e[33m总计 0\e[0m
+\e[1m│ 速率限制: \e[0m\e[90m不可用\e[0m
+\e[1m│ 项目: \e[0m\e[36mhttps://linear.app/project/project/issues\e[0m
+\e[1m│ 仪表盘: \e[0m\e[36mhttp://127.0.0.1:4000/\e[0m
+\e[1m│ 下次刷新: \e[0m\e[90m暂无\e[0m
+\e[1m├─ 运行中\e[0m
 │
-│   \e[90mID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                                  \e[0m
+│   \e[90m编号       阶段             PID      时长 / 轮次...   令牌         会话             事件                                     \e[0m
 │   \e[90m───────────────────────────────────────────────────────────────────────────────────────────────────────────────\e[0m
-│  \e[90mNo active agents\e[0m
+│  \e[90m当前没有活跃 Agent\e[0m
 │
-\e[1m├─ Backoff queue\e[0m
+\e[1m├─ 退避队列\e[0m
 │
-│  \e[90mNo queued retries\e[0m
+│  \e[90m当前没有排队中的重试\e[0m
 ╰─

@@ -409,7 +409,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     conn = get(build_conn(), "/api/v1/MT-MISSING")
 
     assert json_response(conn, 404) == %{
-             "error" => %{"code" => "issue_not_found", "message" => "Issue not found"}
+             "error" => %{"code" => "issue_not_found", "message" => "未找到问题"}
            }
 
     conn = post(build_conn(), "/api/v1/refresh", %{})
@@ -423,33 +423,33 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)
 
     assert json_response(post(build_conn(), "/api/v1/state", %{}), 405) ==
-             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+             %{"error" => %{"code" => "method_not_allowed", "message" => "不支持该请求方法"}}
 
     assert json_response(get(build_conn(), "/api/v1/refresh"), 405) ==
-             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+             %{"error" => %{"code" => "method_not_allowed", "message" => "不支持该请求方法"}}
 
     assert json_response(post(build_conn(), "/", %{}), 405) ==
-             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+             %{"error" => %{"code" => "method_not_allowed", "message" => "不支持该请求方法"}}
 
     assert json_response(post(build_conn(), "/api/v1/MT-1", %{}), 405) ==
-             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+             %{"error" => %{"code" => "method_not_allowed", "message" => "不支持该请求方法"}}
 
     assert json_response(get(build_conn(), "/unknown"), 404) ==
-             %{"error" => %{"code" => "not_found", "message" => "Route not found"}}
+             %{"error" => %{"code" => "not_found", "message" => "未找到路由"}}
 
     state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
 
     assert state_payload ==
              %{
                "generated_at" => state_payload["generated_at"],
-               "error" => %{"code" => "snapshot_unavailable", "message" => "Snapshot unavailable"}
+               "error" => %{"code" => "snapshot_unavailable", "message" => "快照不可用"}
              }
 
     assert json_response(post(build_conn(), "/api/v1/refresh", %{}), 503) ==
              %{
                "error" => %{
                  "code" => "orchestrator_unavailable",
-                 "message" => "Orchestrator is unavailable"
+                 "message" => "编排器当前不可用"
                }
              }
   end
@@ -464,7 +464,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert timeout_payload ==
              %{
                "generated_at" => timeout_payload["generated_at"],
-               "error" => %{"code" => "snapshot_timeout", "message" => "Snapshot timed out"}
+               "error" => %{"code" => "snapshot_timeout", "message" => "快照请求超时"}
              }
   end
 
@@ -530,15 +530,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Operations Dashboard"
+    assert html =~ "运行控制台"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
-    assert html =~ "Runtime"
-    assert html =~ "Live"
-    assert html =~ "Offline"
-    assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "运行时长"
+    assert html =~ "在线"
+    assert html =~ "离线"
+    assert html =~ "复制 ID"
+    assert html =~ "Codex 更新"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -594,7 +594,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "Snapshot unavailable"
+    assert html =~ "快照不可用"
     assert html =~ "snapshot_unavailable"
   end
 

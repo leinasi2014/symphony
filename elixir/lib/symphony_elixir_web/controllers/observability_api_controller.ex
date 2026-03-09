@@ -20,7 +20,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
         json(conn, payload)
 
       {:error, :issue_not_found} ->
-        error_response(conn, 404, "issue_not_found", "Issue not found")
+        error_response(conn, 404, "issue_not_found", "未找到问题")
     end
   end
 
@@ -33,18 +33,18 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
         |> json(payload)
 
       {:error, :unavailable} ->
-        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+        error_response(conn, 503, "orchestrator_unavailable", "编排器当前不可用")
     end
   end
 
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
-    error_response(conn, 405, "method_not_allowed", "Method not allowed")
+    error_response(conn, 405, "method_not_allowed", "不支持该请求方法")
   end
 
   @spec not_found(Conn.t(), map()) :: Conn.t()
   def not_found(conn, _params) do
-    error_response(conn, 404, "not_found", "Route not found")
+    error_response(conn, 404, "not_found", "未找到路由")
   end
 
   defp error_response(conn, status, code, message) do

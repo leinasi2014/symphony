@@ -24,10 +24,10 @@ defmodule SymphonyElixirWeb.Presenter do
         }
 
       :timeout ->
-        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "快照请求超时"}}
 
       :unavailable ->
-        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "快照不可用"}}
     end
   end
 

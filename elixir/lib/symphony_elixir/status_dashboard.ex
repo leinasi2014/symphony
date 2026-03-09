@@ -346,30 +346,30 @@ defmodule SymphonyElixir.StatusDashboard do
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
-           colorize("│ Agents: ", @ansi_bold) <>
+           colorize("│ Agent 数: ", @ansi_bold) <>
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
              colorize("#{max_agents}", @ansi_gray),
-           colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
-           colorize("│ Runtime: ", @ansi_bold) <>
+           colorize("│ 吞吐: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
+           colorize("│ 运行时长: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
-           colorize("│ Tokens: ", @ansi_bold) <>
-             colorize("in #{format_count(codex_input_tokens)}", @ansi_yellow) <>
+           colorize("│ 令牌: ", @ansi_bold) <>
+             colorize("输入 #{format_count(codex_input_tokens)}", @ansi_yellow) <>
              colorize(" | ", @ansi_gray) <>
-             colorize("out #{format_count(codex_output_tokens)}", @ansi_yellow) <>
+             colorize("输出 #{format_count(codex_output_tokens)}", @ansi_yellow) <>
              colorize(" | ", @ansi_gray) <>
-             colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
-           colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+             colorize("总计 #{format_count(codex_total_tokens)}", @ansi_yellow),
+           colorize("│ 速率限制: ", @ansi_bold) <> format_rate_limits(rate_limits),
            project_link_lines,
            project_refresh_line,
-           colorize("├─ Running", @ansi_bold),
+           colorize("├─ 运行中", @ansi_bold),
            "│",
            running_table_header_row(running_event_width),
            running_table_separator_row(running_event_width)
          ] ++
            running_rows ++
            running_to_backoff_spacer ++
-           [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
+           [colorize("├─ 退避队列", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
         |> List.flatten()
@@ -378,8 +378,8 @@ defmodule SymphonyElixir.StatusDashboard do
       :error ->
         [
           colorize("╭─ SYMPHONY STATUS", @ansi_bold),
-          colorize("│ Orchestrator snapshot unavailable", @ansi_red),
-          colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
+          colorize("│ 编排器快照不可用", @ansi_red),
+          colorize("│ 吞吐: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
           format_project_link_lines(),
           format_project_refresh_line(nil),
           closing_border()
@@ -396,14 +396,14 @@ defmodule SymphonyElixir.StatusDashboard do
           colorize(linear_project_url(project_slug), @ansi_cyan)
 
         _ ->
-          colorize("n/a", @ansi_gray)
+          colorize("暂无", @ansi_gray)
       end
 
-    project_line = colorize("│ Project: ", @ansi_bold) <> project_part
+    project_line = colorize("│ 项目: ", @ansi_bold) <> project_part
 
     case dashboard_url() do
       url when is_binary(url) ->
-        [project_line, colorize("│ Dashboard: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
+        [project_line, colorize("│ 仪表盘: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
 
       _ ->
         [project_line]
@@ -411,17 +411,17 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_project_refresh_line(%{checking?: true}) do
-    colorize("│ Next refresh: ", @ansi_bold) <> colorize("checking now…", @ansi_cyan)
+    colorize("│ 下次刷新: ", @ansi_bold) <> colorize("正在检查…", @ansi_cyan)
   end
 
   defp format_project_refresh_line(%{next_poll_in_ms: due_in_ms}) when is_integer(due_in_ms) do
     due_in_ms = max(due_in_ms, 0)
     seconds = div(due_in_ms + 999, 1000)
-    colorize("│ Next refresh: ", @ansi_bold) <> colorize("#{seconds}s", @ansi_cyan)
+    colorize("│ 下次刷新: ", @ansi_bold) <> colorize("#{seconds}秒", @ansi_cyan)
   end
 
   defp format_project_refresh_line(_) do
-    colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
+    colorize("│ 下次刷新: ", @ansi_bold) <> colorize("暂无", @ansi_gray)
   end
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
@@ -573,7 +573,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_running_rows(running, running_event_width) do
     if running == [] do
       [
-        "│  " <> colorize("No active agents", @ansi_gray),
+        "│  " <> colorize("当前没有活跃 Agent", @ansi_gray),
         "│"
       ]
     else
@@ -644,7 +644,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_retry_rows(retrying) do
     if retrying == [] do
-      ["│  " <> colorize("No queued retries", @ansi_gray)]
+      ["│  " <> colorize("当前没有排队中的重试", @ansi_gray)]
     else
       retrying
       |> Enum.sort_by(& &1.due_in_ms)
@@ -675,7 +675,7 @@ defmodule SymphonyElixir.StatusDashboard do
     "#{secs}.#{String.pad_leading(to_string(millis), 3, "0")}s"
   end
 
-  defp next_in_words(_), do: "n/a"
+  defp next_in_words(_), do: "暂无"
 
   defp format_retry_error(error) when is_binary(error) do
     sanitized =
@@ -701,11 +701,11 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_runtime_seconds(seconds) when is_integer(seconds) do
     mins = div(seconds, 60)
     secs = rem(seconds, 60)
-    "#{mins}m #{secs}s"
+    "#{mins}分 #{secs}秒"
   end
 
   defp format_runtime_seconds(seconds) when is_binary(seconds), do: seconds
-  defp format_runtime_seconds(_), do: "0m 0s"
+  defp format_runtime_seconds(_), do: "0分 0秒"
 
   defp format_runtime_and_turns(seconds, turn_count) when is_integer(turn_count) and turn_count > 0 do
     "#{format_runtime_seconds(seconds)} / #{turn_count}"
@@ -736,13 +736,13 @@ defmodule SymphonyElixir.StatusDashboard do
   defp running_table_header_row(running_event_width) do
     header =
       [
-        format_cell("ID", @running_id_width),
-        format_cell("STAGE", @running_stage_width),
+        format_cell("编号", @running_id_width),
+        format_cell("阶段", @running_stage_width),
         format_cell("PID", @running_pid_width),
-        format_cell("AGE / TURN", @running_age_width),
-        format_cell("TOKENS", @running_tokens_width),
-        format_cell("SESSION", @running_session_width),
-        format_cell("EVENT", running_event_width)
+        format_cell("时长 / 轮次", @running_age_width),
+        format_cell("令牌", @running_tokens_width),
+        format_cell("会话", @running_session_width),
+        format_cell("事件", running_event_width)
       ]
       |> Enum.join(" ")
 
@@ -826,8 +826,8 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp compact_session_id(nil), do: "n/a"
-  defp compact_session_id(session_id) when not is_binary(session_id), do: "n/a"
+  defp compact_session_id(nil), do: "暂无"
+  defp compact_session_id(session_id) when not is_binary(session_id), do: "暂无"
 
   defp compact_session_id(session_id) do
     if String.length(session_id) > 10 do
@@ -917,7 +917,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp in_bucket?(timestamp, bucket_start, bucket_end, false),
     do: timestamp >= bucket_start and timestamp < bucket_end
 
-  defp format_rate_limits(nil), do: colorize("unavailable", @ansi_gray)
+  defp format_rate_limits(nil), do: colorize("不可用", @ansi_gray)
 
   defp format_rate_limits(rate_limits) when is_map(rate_limits) do
     limit_id =
@@ -930,9 +930,9 @@ defmodule SymphonyElixir.StatusDashboard do
 
     colorize(to_string(limit_id), @ansi_yellow) <>
       colorize(" | ", @ansi_gray) <>
-      colorize("primary #{primary}", @ansi_cyan) <>
+      colorize("主限额 #{primary}", @ansi_cyan) <>
       colorize(" | ", @ansi_gray) <>
-      colorize("secondary #{secondary}", @ansi_cyan) <>
+      colorize("次限额 #{secondary}", @ansi_cyan) <>
       colorize(" | ", @ansi_gray) <>
       colorize(credits, @ansi_green)
   end
@@ -944,7 +944,7 @@ defmodule SymphonyElixir.StatusDashboard do
     |> colorize(@ansi_gray)
   end
 
-  defp format_rate_limit_bucket(nil), do: "n/a"
+  defp format_rate_limit_bucket(nil), do: "暂无"
 
   defp format_rate_limit_bucket(bucket) when is_map(bucket) do
     remaining = map_value(bucket, ["remaining", :remaining])
@@ -972,13 +972,13 @@ defmodule SymphonyElixir.StatusDashboard do
           "#{format_count(remaining)}/#{format_count(limit)}"
 
         integer_like?(remaining) ->
-          "remaining #{format_count(remaining)}"
+          "剩余 #{format_count(remaining)}"
 
         integer_like?(limit) ->
-          "limit #{format_count(limit)}"
+          "上限 #{format_count(limit)}"
 
         map_size(bucket) == 0 ->
-          "n/a"
+          "暂无"
 
         true ->
           bucket |> inspect(limit: 6) |> truncate(40)
@@ -993,7 +993,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_rate_limit_bucket(other), do: to_string(other)
 
-  defp format_rate_limit_credits(nil), do: "credits n/a"
+  defp format_rate_limit_credits(nil), do: "额度 暂无"
 
   defp format_rate_limit_credits(credits) when is_map(credits) do
     unlimited = map_value(credits, ["unlimited", :unlimited]) == true
@@ -1002,20 +1002,20 @@ defmodule SymphonyElixir.StatusDashboard do
 
     cond do
       unlimited ->
-        "credits unlimited"
+        "额度 不限"
 
       has_credits and is_number(balance) ->
-        "credits #{format_number(balance)}"
+        "额度 #{format_number(balance)}"
 
       has_credits ->
-        "credits available"
+        "额度 可用"
 
       true ->
-        "credits none"
+        "额度 无"
     end
   end
 
-  defp format_rate_limit_credits(other), do: "credits #{to_string(other)}"
+  defp format_rate_limit_credits(other), do: "额度 #{to_string(other)}"
 
   defp format_reset_value(value) when is_integer(value), do: "#{format_count(value)}s"
   defp format_reset_value(value) when is_binary(value), do: value

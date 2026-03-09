@@ -1,21 +1,21 @@
 ```text
 ╭─ SYMPHONY STATUS
-│ Agents: 2/10
-│ Throughput: 1,842 tps
-│ Runtime: 72m 1s
-│ Tokens: in 250,000 | out 18,500 | total 268,500
-│ Rate Limits: gpt-5 | primary 12,345/20,000 reset 30s | secondary 45/60 reset 12s | credits 9876.50
-│ Project: https://linear.app/project/project/issues
-│ Next refresh: n/a
-├─ Running
+│ Agent 数: 2/10
+│ 吞吐: 1,842 tps
+│ 运行时长: 72分 1秒
+│ 令牌: 输入 250,000 | 输出 18,500 | 总计 268,500
+│ 速率限制: gpt-5 | 主限额 12,345/20,000 reset 30s | 次限额 45/60 reset 12s | 额度 9876.50
+│ 项目: https://linear.app/project/project/issues
+│ 下次刷新: 暂无
+├─ 运行中
 │
-│   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                                  
+│   编号       阶段             PID      时长 / 轮次...   令牌         会话             事件                                     
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-│ ● MT-101   running        4242     13m 5s / 11     120,450 thre...567890  turn completed (completed)             
-│ ● MT-102   running        5252     6m 52s / 4       89,200 thre...567890  mix test --cover                       
+│ ● MT-101   running        4242     13分 5秒 / ...    120,450 thre...567890  turn completed (completed)             
+│ ● MT-102   running        5252     6分 52秒 / ...     89,200 thre...567890  mix test --cover                       
 │
-├─ Backoff queue
+├─ 退避队列
 │
-│  No queued retries
+│  当前没有排队中的重试
 ╰─
 ```

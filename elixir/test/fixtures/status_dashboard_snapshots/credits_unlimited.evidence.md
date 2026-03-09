@@ -1,20 +1,20 @@
 ```text
 ╭─ SYMPHONY STATUS
-│ Agents: 1/10
-│ Throughput: 42 tps
-│ Runtime: 1m 15s
-│ Tokens: in 90 | out 12 | total 102
-│ Rate Limits: priority-tier | primary 100/100 reset 1s | secondary 500/500 reset 1s | credits unlimited
-│ Project: https://linear.app/project/project/issues
-│ Next refresh: n/a
-├─ Running
+│ Agent 数: 1/10
+│ 吞吐: 42 tps
+│ 运行时长: 1分 15秒
+│ 令牌: 输入 90 | 输出 12 | 总计 102
+│ 速率限制: priority-tier | 主限额 100/100 reset 1s | 次限额 500/500 reset 1s | 额度 不限
+│ 项目: https://linear.app/project/project/issues
+│ 下次刷新: 暂无
+├─ 运行中
 │
-│   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                                  
+│   编号       阶段             PID      时长 / 轮次...   令牌         会话             事件                                     
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-│ ● MT-777   running        4242     1m 15s / 7        3,200 thre...567890  thread token usage updated (in 90, o...
+│ ● MT-777   running        4242     1分 15秒 / ...      3,200 thre...567890  thread token usage updated (in 90, o...
 │
-├─ Backoff queue
+├─ 退避队列
 │
-│  No queued retries
+│  当前没有排队中的重试
 ╰─
 ```

@@ -75,6 +75,11 @@ Pass a custom workflow file path to `./bin/symphony` when starting the service:
 
 If no path is passed, Symphony defaults to `./WORKFLOW.md`.
 
+This fork also includes local workflow variants for WSL-based setup:
+
+- `WORKFLOW.local.md`: minimal in-memory tracker profile for local smoke tests.
+- `WORKFLOW.linear.local.md`: Linear-backed profile that uses local WSL Codex and workspaces.
+
 Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)

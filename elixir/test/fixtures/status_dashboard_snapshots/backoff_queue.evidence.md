@@ -1,19 +1,19 @@
 ```text
 ╭─ SYMPHONY STATUS
-│ Agents: 1/10
-│ Throughput: 15 tps
-│ Runtime: 45m 0s
-│ Tokens: in 18,000 | out 2,200 | total 20,200
-│ Rate Limits: gpt-5 | primary 0/20,000 reset 95s | secondary 0/60 reset 45s | credits none
-│ Project: https://linear.app/project/project/issues
-│ Next refresh: n/a
-├─ Running
+│ Agent 数: 1/10
+│ 吞吐: 15 tps
+│ 运行时长: 45分 0秒
+│ 令牌: 输入 18,000 | 输出 2,200 | 总计 20,200
+│ 速率限制: gpt-5 | 主限额 0/20,000 reset 95s | 次限额 0/60 reset 45s | 额度 无
+│ 项目: https://linear.app/project/project/issues
+│ 下次刷新: 暂无
+├─ 运行中
 │
-│   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                                  
+│   编号       阶段             PID      时长 / 轮次...   令牌         会话             事件                                     
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-│ ● MT-638   retrying       4242     20m 25s / 7      14,200 thre...567890  agent message streaming: waiting on ...
+│ ● MT-638   retrying       4242     20分 25秒 /...     14,200 thre...567890  agent message streaming: waiting on ...
 │
-├─ Backoff queue
+├─ 退避队列
 │
 │  ↻ MT-450 attempt=4 in 1.250s error=rate limit exhausted
 │  ↻ MT-451 attempt=2 in 3.900s error=retrying after API timeout with jitter
