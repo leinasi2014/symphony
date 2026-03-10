@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, Guardrails, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -310,6 +310,11 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false)
 
+      !issue_executable_under_guardrails?(issue) ->
+        Logger.info("Issue no longer executable under guardrails: #{issue_context(issue)} labels=#{inspect(issue.labels)}; stopping active agent")
+
+        terminate_running_issue(state, issue.id, false)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
@@ -477,6 +482,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
+      issue_executable_under_guardrails?(issue) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -529,6 +535,24 @@ defmodule SymphonyElixir.Orchestrator do
        do: assigned_to_worker
 
   defp issue_routable_to_worker?(_issue), do: true
+
+  defp issue_executable_under_guardrails?(%Issue{} = issue) do
+    cond do
+      !Config.guardrails_enabled?() ->
+        true
+
+      Config.validate!() != :ok ->
+        true
+
+      true ->
+        Guardrails.executable_issue?(issue, %{
+          executable_labels: Config.guardrails_executable_labels(),
+          blocked_labels: Config.guardrails_blocked_labels()
+        })
+    end
+  end
+
+  defp issue_executable_under_guardrails?(_issue), do: false
 
   defp todo_issue_blocked_by_non_terminal?(
          %Issue{state: issue_state, blocked_by: blockers},
@@ -1107,6 +1131,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
+      issue_executable_under_guardrails?(issue) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
 

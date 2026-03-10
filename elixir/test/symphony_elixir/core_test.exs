@@ -553,6 +553,205 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "guardrails prevent dispatch for issues without executable labels or with blocked labels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "observe",
+        stop_state: "Human Review",
+        executable_labels: ["exec-ready"],
+        blocked_labels: ["meta", "manual-env"]
+      }
+    )
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    missing_exec_label_issue = %Issue{
+      id: "issue-guardrails-dispatch-1",
+      identifier: "MT-801",
+      state: "Todo",
+      title: "Missing exec label",
+      description: "Should not dispatch",
+      labels: ["improvement"]
+    }
+
+    blocked_issue = %Issue{
+      id: "issue-guardrails-dispatch-2",
+      identifier: "MT-802",
+      state: "Todo",
+      title: "Blocked by meta label",
+      description: "Should not dispatch",
+      labels: ["exec-ready", "meta"]
+    }
+
+    executable_issue = %Issue{
+      id: "issue-guardrails-dispatch-3",
+      identifier: "MT-803",
+      state: "Todo",
+      title: "Executable",
+      description: "Should dispatch",
+      labels: [" Exec-Ready "]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(missing_exec_label_issue, state)
+    refute Orchestrator.should_dispatch_issue_for_test(blocked_issue, state)
+    assert Orchestrator.should_dispatch_issue_for_test(executable_issue, state)
+  end
+
+  test "guardrails stop running issues when labels become non-executable during reconciliation" do
+    issue_id = "issue-guardrails-reconcile"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "observe",
+        stop_state: "Human Review",
+        executable_labels: ["exec-ready"],
+        blocked_labels: ["meta", "manual-env"]
+      }
+    )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-804",
+          issue: %Issue{
+            id: issue_id,
+            identifier: "MT-804",
+            state: "In Progress",
+            labels: ["exec-ready"]
+          },
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-804",
+      state: "In Progress",
+      title: "Guardrails reconciliation stop",
+      description: "Worker should stop once labels become blocked",
+      labels: ["exec-ready", "meta"]
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Process.alive?(agent_pid)
+  end
+
+  test "guardrails skip revalidation for retry dispatch when labels become non-executable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "observe",
+        stop_state: "Human Review",
+        executable_labels: ["exec-ready"],
+        blocked_labels: ["meta", "manual-env"]
+      }
+    )
+
+    stale_issue = %Issue{
+      id: "issue-guardrails-retry",
+      identifier: "MT-805",
+      state: "Todo",
+      title: "Retry candidate",
+      description: "Initially executable",
+      labels: ["exec-ready"]
+    }
+
+    refreshed_issue = %Issue{
+      stale_issue
+      | labels: ["exec-ready", "meta"]
+    }
+
+    assert {:skip, ^refreshed_issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(stale_issue, fn [_issue_id] ->
+               {:ok, [refreshed_issue]}
+             end)
+  end
+
+  test "invalid guardrails config does not stop running issues during reconciliation" do
+    issue_id = "issue-guardrails-invalid-reconcile"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        executable_labels: ["exec-ready"],
+        blocked_labels: ["meta"]
+      }
+    )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-806",
+          issue: %Issue{
+            id: issue_id,
+            identifier: "MT-806",
+            state: "In Progress",
+            labels: ["exec-ready"]
+          },
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-806",
+      state: "In Progress",
+      title: "Invalid guardrails config",
+      description: "Guardrails should not stop the worker while config is invalid",
+      labels: ["exec-ready", "meta"]
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
