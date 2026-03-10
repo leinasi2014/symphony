@@ -28,6 +28,28 @@ defmodule SymphonyElixir.Config do
   @default_max_concurrent_agents 10
   @default_agent_max_turns 20
   @default_max_retry_backoff_ms 300_000
+  @default_guardrails_enabled false
+  @default_guardrails_mode "observe"
+  @default_guardrails_create_comment_on_stop true
+  @default_guardrails_warning_cooldown_seconds 60
+  @default_guardrails_executable_labels []
+  @default_guardrails_blocked_labels ["meta", "split-before-run", "manual-env"]
+  @default_guardrails_probe %{
+    max_total_turns_per_issue: 1,
+    soft_total_tokens: 25_000,
+    hard_total_tokens: 50_000,
+    soft_input_tokens: 20_000,
+    hard_input_tokens: 40_000
+  }
+  @default_guardrails_default %{
+    max_total_turns_per_issue: 3,
+    max_continuation_runs_per_issue: 2,
+    no_progress_turn_limit: 1,
+    soft_total_tokens: 120_000,
+    hard_total_tokens: 180_000,
+    soft_input_tokens: 100_000,
+    hard_input_tokens: 150_000
+  }
   @default_codex_command "codex app-server"
   @default_codex_turn_timeout_ms 3_600_000
   @default_codex_read_timeout_ms 5_000
@@ -97,6 +119,100 @@ defmodule SymphonyElixir.Config do
                                  max_concurrent_agents_by_state: [
                                    type: {:map, :string, :pos_integer},
                                    default: %{}
+                                 ],
+                                 guardrails: [
+                                   type: :map,
+                                   default: %{},
+                                   keys: [
+                                     enabled: [
+                                       type: :boolean,
+                                       default: @default_guardrails_enabled
+                                     ],
+                                     mode: [
+                                       type: :string,
+                                       default: @default_guardrails_mode
+                                     ],
+                                     stop_state: [
+                                       type: {:or, [:string, nil]},
+                                       default: nil
+                                     ],
+                                     create_comment_on_stop: [
+                                       type: :boolean,
+                                       default: @default_guardrails_create_comment_on_stop
+                                     ],
+                                     warning_cooldown_seconds: [
+                                       type: :non_neg_integer,
+                                       default: @default_guardrails_warning_cooldown_seconds
+                                     ],
+                                     executable_labels: [
+                                       type: {:list, :string},
+                                       default: @default_guardrails_executable_labels
+                                     ],
+                                     blocked_labels: [
+                                       type: {:list, :string},
+                                       default: @default_guardrails_blocked_labels
+                                     ],
+                                     probe: [
+                                       type: :map,
+                                       default: %{},
+                                       keys: [
+                                         max_total_turns_per_issue: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_probe.max_total_turns_per_issue
+                                         ],
+                                         soft_total_tokens: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_probe.soft_total_tokens
+                                         ],
+                                         hard_total_tokens: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_probe.hard_total_tokens
+                                         ],
+                                         soft_input_tokens: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_probe.soft_input_tokens
+                                         ],
+                                         hard_input_tokens: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_probe.hard_input_tokens
+                                         ]
+                                       ]
+                                     ],
+                                     default: [
+                                       type: :map,
+                                       default: %{},
+                                       keys: [
+                                         max_total_turns_per_issue: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_default.max_total_turns_per_issue
+                                         ],
+                                         max_continuation_runs_per_issue: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_default.max_continuation_runs_per_issue
+                                         ],
+                                         no_progress_turn_limit: [
+                                           type: :non_neg_integer,
+                                           default: @default_guardrails_default.no_progress_turn_limit
+                                         ],
+                                         soft_total_tokens: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_default.soft_total_tokens
+                                         ],
+                                         hard_total_tokens: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_default.hard_total_tokens
+                                         ],
+                                         soft_input_tokens: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_default.soft_input_tokens
+                                         ],
+                                         hard_input_tokens: [
+                                           type: :pos_integer,
+                                           default: @default_guardrails_default.hard_input_tokens
+                                         ]
+                                       ]
+                                     ]
+                                   ]
                                  ]
                                ]
                              ],
@@ -171,6 +287,26 @@ defmodule SymphonyElixir.Config do
           after_run: String.t() | nil,
           before_remove: String.t() | nil,
           timeout_ms: pos_integer()
+        }
+  @type guardrails_budget :: %{
+          optional(:max_total_turns_per_issue) => pos_integer(),
+          optional(:max_continuation_runs_per_issue) => pos_integer(),
+          optional(:no_progress_turn_limit) => non_neg_integer(),
+          optional(:soft_total_tokens) => pos_integer(),
+          optional(:hard_total_tokens) => pos_integer(),
+          optional(:soft_input_tokens) => pos_integer(),
+          optional(:hard_input_tokens) => pos_integer()
+        }
+  @type guardrails_settings :: %{
+          enabled: boolean(),
+          mode: String.t(),
+          stop_state: String.t() | nil,
+          create_comment_on_stop: boolean(),
+          warning_cooldown_seconds: non_neg_integer(),
+          executable_labels: [String.t()],
+          blocked_labels: [String.t()],
+          probe: guardrails_budget(),
+          default: guardrails_budget()
         }
 
   @spec current_workflow() :: {:ok, workflow_payload()} | {:error, term()}
@@ -262,6 +398,56 @@ defmodule SymphonyElixir.Config do
   @spec agent_max_turns() :: pos_integer()
   def agent_max_turns do
     get_in(validated_workflow_options(), [:agent, :max_turns])
+  end
+
+  @spec guardrails() :: guardrails_settings()
+  def guardrails do
+    get_in(validated_workflow_options(), [:agent, :guardrails])
+  end
+
+  @spec guardrails_enabled?() :: boolean()
+  def guardrails_enabled? do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :enabled])
+  end
+
+  @spec guardrails_mode() :: String.t()
+  def guardrails_mode do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :mode])
+  end
+
+  @spec guardrails_stop_state() :: String.t() | nil
+  def guardrails_stop_state do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :stop_state])
+  end
+
+  @spec guardrails_create_comment_on_stop?() :: boolean()
+  def guardrails_create_comment_on_stop? do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :create_comment_on_stop])
+  end
+
+  @spec guardrails_warning_cooldown_seconds() :: non_neg_integer()
+  def guardrails_warning_cooldown_seconds do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :warning_cooldown_seconds])
+  end
+
+  @spec guardrails_executable_labels() :: [String.t()]
+  def guardrails_executable_labels do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :executable_labels])
+  end
+
+  @spec guardrails_blocked_labels() :: [String.t()]
+  def guardrails_blocked_labels do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :blocked_labels])
+  end
+
+  @spec guardrails_probe_budget() :: guardrails_budget()
+  def guardrails_probe_budget do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :probe])
+  end
+
+  @spec guardrails_default_budget() :: guardrails_budget()
+  def guardrails_default_budget do
+    get_in(validated_workflow_options(), [:agent, :guardrails, :default])
   end
 
   @spec max_concurrent_agents_for_state(term()) :: pos_integer()
@@ -367,6 +553,7 @@ defmodule SymphonyElixir.Config do
          :ok <- require_tracker_kind(),
          :ok <- require_linear_token(),
          :ok <- require_linear_project(),
+         :ok <- require_valid_guardrails_config(),
          :ok <- require_valid_codex_runtime_settings() do
       require_codex_command()
     end
@@ -438,6 +625,62 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  defp require_valid_guardrails_config do
+    if guardrails_enabled?() do
+      with :ok <- require_guardrails_mode(),
+           :ok <- require_guardrails_stop_state(),
+           :ok <- require_guardrails_stop_state_not_active(),
+           :ok <- require_guardrails_label_sets_do_not_overlap() do
+        :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp require_guardrails_mode do
+    if guardrails_mode() in ["observe", "enforce"] do
+      :ok
+    else
+      {:error, {:invalid_guardrails_mode, guardrails_mode()}}
+    end
+  end
+
+  defp require_guardrails_stop_state do
+    case guardrails_stop_state() do
+      stop_state when is_binary(stop_state) and stop_state != "" -> :ok
+      _ -> {:error, :missing_guardrails_stop_state}
+    end
+  end
+
+  defp require_guardrails_stop_state_not_active do
+    normalized_stop_state = normalize_issue_state(to_string(guardrails_stop_state()))
+    normalized_active_states = Enum.map(linear_active_states(), &normalize_issue_state/1)
+
+    if normalized_stop_state in normalized_active_states do
+      {:error, {:guardrails_stop_state_is_active, guardrails_stop_state()}}
+    else
+      :ok
+    end
+  end
+
+  defp require_guardrails_label_sets_do_not_overlap do
+    executable_labels = MapSet.new(normalize_guardrail_labels(guardrails_executable_labels()))
+    blocked_labels = MapSet.new(normalize_guardrail_labels(guardrails_blocked_labels()))
+
+    overlap =
+      executable_labels
+      |> MapSet.intersection(blocked_labels)
+      |> MapSet.to_list()
+      |> Enum.sort()
+
+    if overlap == [] do
+      :ok
+    else
+      {:error, {:guardrails_label_overlap, overlap}}
+    end
+  end
+
   defp validated_workflow_options do
     workflow_config()
     |> extract_workflow_options()
@@ -487,6 +730,61 @@ defmodule SymphonyElixir.Config do
       :max_concurrent_agents_by_state,
       state_limits_value(Map.get(section, "max_concurrent_agents_by_state"))
     )
+    |> put_if_present(:guardrails, extract_guardrails_options(section_map(section, "guardrails")))
+  end
+
+  defp extract_guardrails_options(section) do
+    %{}
+    |> put_if_present(:enabled, boolean_value(Map.get(section, "enabled")))
+    |> put_if_present(:mode, normalize_guardrails_mode(Map.get(section, "mode")))
+    |> put_if_present(:stop_state, scalar_string_value(Map.get(section, "stop_state")))
+    |> put_if_present(
+      :create_comment_on_stop,
+      boolean_value(Map.get(section, "create_comment_on_stop"))
+    )
+    |> put_if_present(
+      :warning_cooldown_seconds,
+      non_negative_integer_value(Map.get(section, "warning_cooldown_seconds"))
+    )
+    |> put_if_present(:executable_labels, csv_value(Map.get(section, "executable_labels")))
+    |> put_if_present(:blocked_labels, csv_value(Map.get(section, "blocked_labels")))
+    |> put_if_present(:probe, extract_guardrails_probe_options(section_map(section, "probe")))
+    |> put_if_present(
+      :default,
+      extract_guardrails_default_options(section_map(section, "default"))
+    )
+  end
+
+  defp extract_guardrails_probe_options(section) do
+    %{}
+    |> put_if_present(
+      :max_total_turns_per_issue,
+      positive_integer_value(Map.get(section, "max_total_turns_per_issue"))
+    )
+    |> put_if_present(:soft_total_tokens, positive_integer_value(Map.get(section, "soft_total_tokens")))
+    |> put_if_present(:hard_total_tokens, positive_integer_value(Map.get(section, "hard_total_tokens")))
+    |> put_if_present(:soft_input_tokens, positive_integer_value(Map.get(section, "soft_input_tokens")))
+    |> put_if_present(:hard_input_tokens, positive_integer_value(Map.get(section, "hard_input_tokens")))
+  end
+
+  defp extract_guardrails_default_options(section) do
+    %{}
+    |> put_if_present(
+      :max_total_turns_per_issue,
+      positive_integer_value(Map.get(section, "max_total_turns_per_issue"))
+    )
+    |> put_if_present(
+      :max_continuation_runs_per_issue,
+      positive_integer_value(Map.get(section, "max_continuation_runs_per_issue"))
+    )
+    |> put_if_present(
+      :no_progress_turn_limit,
+      non_negative_integer_value(Map.get(section, "no_progress_turn_limit"))
+    )
+    |> put_if_present(:soft_total_tokens, positive_integer_value(Map.get(section, "soft_total_tokens")))
+    |> put_if_present(:hard_total_tokens, positive_integer_value(Map.get(section, "hard_total_tokens")))
+    |> put_if_present(:soft_input_tokens, positive_integer_value(Map.get(section, "soft_input_tokens")))
+    |> put_if_present(:hard_input_tokens, positive_integer_value(Map.get(section, "hard_input_tokens")))
   end
 
   defp extract_codex_options(section) do
@@ -792,6 +1090,38 @@ defmodule SymphonyElixir.Config do
   end
 
   defp normalize_tracker_kind(_kind), do: nil
+
+  defp normalize_guardrails_mode(value) do
+    case scalar_string_value(value) do
+      :omit ->
+        :omit
+
+      normalized ->
+        normalized
+        |> String.trim()
+        |> String.downcase()
+        |> case do
+          "" -> :omit
+          mode -> mode
+        end
+    end
+  end
+
+  defp normalize_guardrail_labels(labels) when is_list(labels) do
+    labels
+    |> Enum.map(&normalize_guardrail_label/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp normalize_guardrail_labels(_labels), do: []
+
+  defp normalize_guardrail_label(label) when is_binary(label) do
+    label
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_guardrail_label(label), do: normalize_guardrail_label(to_string(label))
 
   defp workflow_config do
     case current_workflow() do

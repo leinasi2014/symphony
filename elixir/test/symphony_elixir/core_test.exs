@@ -16,6 +16,31 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.linear_terminal_states() == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert Config.linear_assignee() == nil
     assert Config.agent_max_turns() == 20
+    refute Config.guardrails_enabled?()
+    assert Config.guardrails_mode() == "observe"
+    assert Config.guardrails_stop_state() == nil
+    assert Config.guardrails_create_comment_on_stop?()
+    assert Config.guardrails_warning_cooldown_seconds() == 60
+    assert Config.guardrails_executable_labels() == []
+    assert Config.guardrails_blocked_labels() == ["meta", "split-before-run", "manual-env"]
+
+    assert Config.guardrails_probe_budget() == %{
+             max_total_turns_per_issue: 1,
+             soft_total_tokens: 25_000,
+             hard_total_tokens: 50_000,
+             soft_input_tokens: 20_000,
+             hard_input_tokens: 40_000
+           }
+
+    assert Config.guardrails_default_budget() == %{
+             max_total_turns_per_issue: 3,
+             max_continuation_runs_per_issue: 2,
+             no_progress_turn_limit: 1,
+             soft_total_tokens: 120_000,
+             hard_total_tokens: 180_000,
+             soft_input_tokens: 100_000,
+             hard_input_tokens: 150_000
+           }
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
     assert Config.poll_interval_ms() == 30_000
@@ -69,6 +94,115 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: 123)
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+  end
+
+  test "guardrails config getters resolve from workflow front matter" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "enforce",
+        stop_state: "Human Review",
+        create_comment_on_stop: false,
+        warning_cooldown_seconds: 45,
+        executable_labels: [" exec-ready "],
+        blocked_labels: ["meta", "manual-env"],
+        probe: %{
+          max_total_turns_per_issue: 2,
+          soft_total_tokens: 10_000,
+          hard_total_tokens: 20_000,
+          soft_input_tokens: 8_000,
+          hard_input_tokens: 16_000
+        },
+        default: %{
+          max_total_turns_per_issue: 4,
+          max_continuation_runs_per_issue: 3,
+          no_progress_turn_limit: 0,
+          soft_total_tokens: 200_000,
+          hard_total_tokens: 240_000,
+          soft_input_tokens: 180_000,
+          hard_input_tokens: 220_000
+        }
+      }
+    )
+
+    assert Config.guardrails_enabled?()
+    assert Config.guardrails_mode() == "enforce"
+    assert Config.guardrails_stop_state() == "Human Review"
+    refute Config.guardrails_create_comment_on_stop?()
+    assert Config.guardrails_warning_cooldown_seconds() == 45
+    assert Config.guardrails_executable_labels() == ["exec-ready"]
+    assert Config.guardrails_blocked_labels() == ["meta", "manual-env"]
+
+    assert Config.guardrails_probe_budget() == %{
+             max_total_turns_per_issue: 2,
+             soft_total_tokens: 10_000,
+             hard_total_tokens: 20_000,
+             soft_input_tokens: 8_000,
+             hard_input_tokens: 16_000
+           }
+
+    assert Config.guardrails_default_budget() == %{
+             max_total_turns_per_issue: 4,
+             max_continuation_runs_per_issue: 3,
+             no_progress_turn_limit: 0,
+             soft_total_tokens: 200_000,
+             hard_total_tokens: 240_000,
+             soft_input_tokens: 180_000,
+             hard_input_tokens: 220_000
+           }
+
+    assert :ok = Config.validate!()
+  end
+
+  test "guardrails validation rejects missing stop state active stop states and overlapping labels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true
+      }
+    )
+
+    assert {:error, :missing_guardrails_stop_state} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "banana",
+        stop_state: "Human Review"
+      }
+    )
+
+    assert {:error, {:invalid_guardrails_mode, "banana"}} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      tracker_active_states: ["Todo", "Human Review"],
+      agent_guardrails: %{
+        enabled: true,
+        stop_state: "Human Review"
+      }
+    )
+
+    assert {:error, {:guardrails_stop_state_is_active, "Human Review"}} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        stop_state: "Human Review",
+        executable_labels: ["Exec-Ready", "meta "],
+        blocked_labels: [" meta", "manual-env"]
+      }
+    )
+
+    assert {:error, {:guardrails_label_overlap, ["meta"]}} = Config.validate!()
   end
 
   test "current WORKFLOW.md file is valid and complete" do
