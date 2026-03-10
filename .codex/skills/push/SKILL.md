@@ -27,9 +27,11 @@ description:
 
 1. Identify current branch and confirm remote state.
 2. Run local validation (`make -C elixir all`) before pushing.
-3. Push branch to `origin` with upstream tracking if needed, using whatever
-   remote URL is already configured.
-4. If push is not clean/rejected:
+3. Prefer SSH for GitHub remotes before the first push:
+   - If `origin` points at `https://github.com/...`, switch it to `git@github.com:owner/repo.git` first.
+   - Keep non-GitHub or intentionally custom remotes unchanged.
+4. Push branch to `origin` with upstream tracking if needed.
+5. If push is not clean/rejected:
    - If the failure is a non-fast-forward or sync problem, run the `pull`
      skill to merge `origin/main`, resolve conflicts, and rerun validation.
    - Push again; use `--force-with-lease` only when history was rewritten.
@@ -37,14 +39,14 @@ description:
      the configured remote, stop and surface the exact error instead of
      rewriting remotes or switching protocols as a workaround.
 
-5. Ensure a PR exists for the branch:
+6. Ensure a PR exists for the branch:
    - If no PR exists, create one.
    - If a PR exists and is open, update it.
    - If branch is tied to a closed/merged PR, create a new branch + PR.
    - Write a proper PR title that clearly describes the change outcome
    - For branch updates, explicitly reconsider whether current PR title still
      matches the latest scope; update it if it no longer does.
-6. Write/update PR body explicitly using `.github/pull_request_template.md`:
+7. Write/update PR body explicitly using `.github/pull_request_template.md`:
    - Fill every section with concrete content for this change.
    - Replace all placeholder comments (`<!-- ... -->`).
    - Keep bullets/checkboxes where template expects them.
@@ -52,8 +54,8 @@ description:
      scope (all intended work on the branch), not just the newest commits,
      including newly added work, removed work, or changed approach.
    - Do not reuse stale description text from earlier iterations.
-7. Validate PR body with `mix pr_body.check` and fix all reported issues.
-8. Reply with the PR URL from `gh pr view`.
+8. Validate PR body with `mix pr_body.check` and fix all reported issues.
+9. Reply with the PR URL from `gh pr view`.
 
 ## Commands
 
@@ -64,7 +66,14 @@ branch=$(git branch --show-current)
 # Minimal validation gate
 make -C elixir all
 
-# Initial push: respect the current origin remote.
+# For GitHub remotes, prefer SSH before the first push.
+origin_url=$(git remote get-url origin)
+if printf '%s' "$origin_url" | grep -q '^https://github.com/'; then
+  ssh_url=$(printf '%s' "$origin_url" | sed -E 's#https://github.com/#git@github.com:#')
+  git remote set-url origin "$ssh_url"
+fi
+
+# Initial push
 git push -u origin HEAD
 
 # If that failed because the remote moved, use the pull skill. After
@@ -113,5 +122,6 @@ gh pr view --json url -q .url
 - Do not use `--force`; only use `--force-with-lease` as the last resort.
 - Distinguish sync problems from remote auth/permission problems:
   - Use the `pull` skill for non-fast-forward or stale-branch issues.
-  - Surface auth, permissions, or workflow restrictions directly instead of
-    changing remotes or protocols.
+  - For GitHub remotes, SSH is the preferred default transport.
+  - If auth fails on `https://github.com/...`, switch `origin` to SSH before treating it as a blocker.
+  - Surface remaining auth, permissions, or workflow restrictions directly once SSH has been attempted.

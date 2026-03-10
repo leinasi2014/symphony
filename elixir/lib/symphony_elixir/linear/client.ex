@@ -207,6 +207,12 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   @doc false
+  @spec request_options_for_test(String.t(), map()) :: keyword()
+  def request_options_for_test(endpoint, env) when is_binary(endpoint) and is_map(env) do
+    request_options(endpoint, env)
+  end
+
+  @doc false
   @spec next_page_cursor_for_test(map()) :: {:ok, String.t()} | :done | {:error, term()}
   def next_page_cursor_for_test(page_info) when is_map(page_info), do: next_page_cursor(page_info)
 
@@ -339,12 +345,69 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp post_graphql_request(payload, headers) do
-    Req.post(Config.linear_endpoint(),
-      headers: headers,
-      json: payload,
-      connect_options: [timeout: 30_000]
-    )
+    endpoint = Config.linear_endpoint()
+
+    Req.post(endpoint, [headers: headers, json: payload] ++ request_options(endpoint, System.get_env()))
   end
+
+  defp request_options(endpoint, env) do
+    [connect_options: [timeout: 30_000] ++ proxy_connect_options(endpoint, env)]
+  end
+
+  defp proxy_connect_options(endpoint, env) when is_binary(endpoint) and is_map(env) do
+    endpoint
+    |> proxy_url_for_endpoint(env)
+    |> build_proxy_connect_options()
+  end
+
+  defp proxy_url_for_endpoint(endpoint, env) do
+    case URI.parse(endpoint).scheme do
+      "https" ->
+        env["HTTPS_PROXY"] || env["https_proxy"] || env["HTTP_PROXY"] || env["http_proxy"]
+
+      "http" ->
+        env["HTTP_PROXY"] || env["http_proxy"]
+
+      _ ->
+        nil
+    end
+  end
+
+  defp build_proxy_connect_options(nil), do: []
+  defp build_proxy_connect_options(""), do: []
+
+  defp build_proxy_connect_options(proxy_url) when is_binary(proxy_url) do
+    case URI.parse(proxy_url) do
+      %URI{scheme: scheme, host: host} = uri when scheme in ["http", "https"] and is_binary(host) ->
+        proxy_connect_options_for_uri(uri)
+
+      _ ->
+        []
+    end
+  end
+
+  defp proxy_connect_options_for_uri(%URI{} = uri) do
+    port = uri.port || default_proxy_port(uri.scheme)
+    options = [proxy: {proxy_scheme(uri.scheme), uri.host, port, []}]
+
+    case proxy_headers_for_uri(uri) do
+      [] -> options
+      headers -> options ++ [proxy_headers: headers]
+    end
+  end
+
+  defp proxy_headers_for_uri(%URI{userinfo: nil}), do: []
+  defp proxy_headers_for_uri(%URI{userinfo: ""}), do: []
+
+  defp proxy_headers_for_uri(%URI{userinfo: userinfo}) do
+    [{"proxy-authorization", "Basic " <> Base.encode64(userinfo)}]
+  end
+
+  defp proxy_scheme("https"), do: :https
+  defp proxy_scheme(_scheme), do: :http
+
+  defp default_proxy_port("https"), do: 443
+  defp default_proxy_port(_scheme), do: 80
 
   defp decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter) do
     issues =

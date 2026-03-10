@@ -1,0 +1,3 @@
+interface:
+  display_name: "Symphony Ops Runbook"
+  short_description: "Operate, debug, and govern Symphony execution"

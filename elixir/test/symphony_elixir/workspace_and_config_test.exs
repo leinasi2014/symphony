@@ -377,6 +377,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear client request options include proxy connect options from env" do
+    opts =
+      Client.request_options_for_test("https://api.linear.app/graphql", %{
+        "HTTPS_PROXY" => "http://127.0.0.1:10808"
+      })
+
+    assert opts == [
+             connect_options: [
+               timeout: 30_000,
+               proxy: {:http, "127.0.0.1", 10_808, []}
+             ]
+           ]
+  end
+
+  test "linear client ignores malformed proxy env values" do
+    opts =
+      Client.request_options_for_test("https://api.linear.app/graphql", %{
+        "HTTPS_PROXY" => "not-a-proxy"
+      })
+
+    assert opts == [connect_options: [timeout: 30_000]]
+  end
+
+  test "config parses tracker assignee from workflow front matter" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_assignee: "me")
+
+    assert Config.linear_assignee() == "me"
+  end
+
   test "orchestrator sorts dispatch by priority then oldest created_at" do
     issue_same_priority_older = %Issue{
       id: "issue-old-high",
