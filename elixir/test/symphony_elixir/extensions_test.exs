@@ -342,7 +342,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "held" => 0},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -354,7 +354,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+                 "guardrails" => nil
                }
              ],
              "retrying" => [
@@ -363,9 +364,11 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_identifier" => "MT-RETRY",
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
-                 "error" => "boom"
+                 "error" => "boom",
+                 "guardrails" => nil
                }
              ],
+             "guardrail_holds" => [],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -392,9 +395,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+               "guardrails" => nil
              },
              "retry" => nil,
+             "guardrails" => nil,
+             "guardrail_hold" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
@@ -416,6 +422,75 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability api exposes guardrail state and held issues" do
+    snapshot = guardrail_snapshot()
+    orchestrator_name = Module.concat(__MODULE__, :GuardrailObservabilityApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert state_payload["counts"] == %{"running" => 1, "retrying" => 1, "held" => 1}
+
+    [running_entry] = state_payload["running"]
+    assert running_entry["issue_identifier"] == "MT-GUARD"
+    assert running_entry["guardrails"]["prompt_mode"] == "probe"
+    assert running_entry["guardrails"]["policy_mode"] == "enforce"
+
+    assert running_entry["guardrails"]["warning"] == %{
+             "reason" => "soft_total_tokens",
+             "at" => "2026-03-10T12:01:00Z"
+           }
+
+    assert running_entry["guardrails"]["budget"]["total_tokens"] == %{
+             "current" => 26_000,
+             "soft_limit" => 25_000,
+             "hard_limit" => 50_000
+           }
+
+    [retry_entry] = state_payload["retrying"]
+    assert retry_entry["issue_identifier"] == "MT-RETRY-GUARD"
+    assert retry_entry["guardrails"]["prompt_mode"] == "default"
+
+    assert retry_entry["guardrails"]["budget"]["continuation_runs"] == %{
+             "current" => 1,
+             "limit" => 2
+           }
+
+    [hold_entry] = state_payload["guardrail_holds"]
+    assert hold_entry["issue_identifier"] == "MT-HOLD"
+    assert hold_entry["stop_reason"] == "max_total_turns_per_issue"
+    assert hold_entry["writeback"] == %{"comment" => "ok", "state" => "ok"}
+    assert hold_entry["guardrails"]["budget"]["total_turns"] == %{"current" => 3, "limit" => 3}
+
+    held_payload = json_response(get(build_conn(), "/api/v1/MT-HOLD"), 200)
+
+    assert held_payload["status"] == "held"
+    assert held_payload["issue_id"] == "issue-held"
+    assert held_payload["guardrails"]["stop_reason"] == "max_total_turns_per_issue"
+
+    assert held_payload["guardrail_hold"] == %{
+             "issue_id" => "issue-held",
+             "issue_identifier" => "MT-HOLD",
+             "held_at" => "2026-03-10T12:03:00Z",
+             "stop_reason" => "max_total_turns_per_issue",
+             "writeback" => %{"comment" => "ok", "state" => "ok"},
+             "guardrails" => held_payload["guardrail_hold"]["guardrails"]
+           }
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -632,7 +707,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "held" => 0}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -703,6 +778,96 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
+      rate_limits: %{"primary" => %{"remaining" => 11}}
+    }
+  end
+
+  defp guardrail_snapshot do
+    %{
+      running: [
+        %{
+          issue_id: "issue-guard",
+          identifier: "MT-GUARD",
+          state: "In Progress",
+          session_id: "thread-guard",
+          turn_count: 1,
+          codex_app_server_pid: nil,
+          last_codex_message: "guardrail warning",
+          last_codex_timestamp: nil,
+          last_codex_event: :notification,
+          codex_input_tokens: 18_000,
+          codex_output_tokens: 8_000,
+          codex_total_tokens: 26_000,
+          started_at: DateTime.utc_now(),
+          guardrails: %{
+            enabled: true,
+            prompt_mode: "probe",
+            policy_mode: "enforce",
+            stop_state: "Human Review",
+            warning: %{"reason" => "soft_total_tokens", "at" => "2026-03-10T12:01:00Z"},
+            stop_reason: nil,
+            counters: %{"total_turns" => 1, "continuation_runs" => 0, "no_progress_turns" => 0},
+            budget: %{
+              "total_tokens" => %{"current" => 26_000, "soft_limit" => 25_000, "hard_limit" => 50_000},
+              "input_tokens" => %{"current" => 18_000, "soft_limit" => 20_000, "hard_limit" => 40_000},
+              "total_turns" => %{"current" => 1, "limit" => 1},
+              "continuation_runs" => %{"current" => 0, "limit" => nil},
+              "no_progress_turns" => %{"current" => 0, "limit" => nil}
+            }
+          }
+        }
+      ],
+      retrying: [
+        %{
+          issue_id: "issue-retry-guard",
+          identifier: "MT-RETRY-GUARD",
+          attempt: 2,
+          due_in_ms: 2_000,
+          error: "boom",
+          guardrails: %{
+            enabled: true,
+            prompt_mode: "default",
+            policy_mode: "enforce",
+            stop_state: "Human Review",
+            warning: nil,
+            stop_reason: nil,
+            counters: %{"total_turns" => 2, "continuation_runs" => 1, "no_progress_turns" => 0},
+            budget: %{
+              "total_tokens" => %{"current" => 80_000, "soft_limit" => 120_000, "hard_limit" => 180_000},
+              "input_tokens" => %{"current" => 60_000, "soft_limit" => 100_000, "hard_limit" => 150_000},
+              "total_turns" => %{"current" => 2, "limit" => 3},
+              "continuation_runs" => %{"current" => 1, "limit" => 2},
+              "no_progress_turns" => %{"current" => 0, "limit" => 1}
+            }
+          }
+        }
+      ],
+      guardrail_holds: [
+        %{
+          issue_id: "issue-held",
+          identifier: "MT-HOLD",
+          held_at: "2026-03-10T12:03:00Z",
+          stop_reason: "max_total_turns_per_issue",
+          writeback: %{"comment" => "ok", "state" => "ok"},
+          guardrails: %{
+            enabled: true,
+            prompt_mode: "default",
+            policy_mode: "enforce",
+            stop_state: "Human Review",
+            warning: nil,
+            stop_reason: "max_total_turns_per_issue",
+            counters: %{"total_turns" => 3, "continuation_runs" => 2, "no_progress_turns" => 1},
+            budget: %{
+              "total_tokens" => %{"current" => 181_000, "soft_limit" => 120_000, "hard_limit" => 180_000},
+              "input_tokens" => %{"current" => 151_000, "soft_limit" => 100_000, "hard_limit" => 150_000},
+              "total_turns" => %{"current" => 3, "limit" => 3},
+              "continuation_runs" => %{"current" => 2, "limit" => 2},
+              "no_progress_turns" => %{"current" => 1, "limit" => 1}
+            }
+          }
+        }
+      ],
+      codex_totals: %{input_tokens: 18_000, output_tokens: 8_000, total_tokens: 26_000, seconds_running: 123},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
   end

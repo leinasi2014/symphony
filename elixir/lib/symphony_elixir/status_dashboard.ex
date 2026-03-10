@@ -331,6 +331,7 @@ defmodule SymphonyElixir.StatusDashboard do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
+        guardrail_holds = Map.get(snapshot, :guardrail_holds, [])
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -343,6 +344,8 @@ defmodule SymphonyElixir.StatusDashboard do
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
+        guardrail_rows = format_guardrail_rows(running, retrying, guardrail_holds)
+        guardrail_section = if(guardrail_rows == [], do: [], else: ["│", colorize("├─ Guardrails", @ansi_bold), "│"] ++ guardrail_rows)
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -371,6 +374,7 @@ defmodule SymphonyElixir.StatusDashboard do
            running_to_backoff_spacer ++
            [colorize("├─ 退避队列", @ansi_bold), "│"] ++
            backoff_rows ++
+           guardrail_section ++
            [closing_border()])
         |> List.flatten()
         |> Enum.join("\n")
@@ -557,6 +561,7 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             guardrail_holds: Map.get(snapshot, :guardrail_holds, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -697,6 +702,140 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_retry_error(_), do: ""
+
+  defp format_guardrail_rows(running, retrying, guardrail_holds) do
+    rows =
+      Enum.filter(running, &guardrail_summary_entry?/1)
+      |> Enum.sort_by(& &1.identifier)
+      |> Enum.map(&format_active_guardrail_summary(&1, "running"))
+
+    rows =
+      rows ++
+        (retrying
+         |> Enum.filter(&guardrail_summary_entry?/1)
+         |> Enum.sort_by(& &1.identifier)
+         |> Enum.map(&format_active_guardrail_summary(&1, "retrying")))
+
+    rows ++
+      (guardrail_holds
+       |> Enum.filter(&guardrail_summary_hold?/1)
+       |> Enum.sort_by(& &1.identifier)
+       |> Enum.map(&format_hold_guardrail_summary/1))
+  end
+
+  defp guardrail_summary_entry?(entry) when is_map(entry) do
+    case Map.get(entry, :guardrails) do
+      guardrails when is_map(guardrails) -> map_size(guardrails) > 0
+      _ -> false
+    end
+  end
+
+  defp guardrail_summary_entry?(_entry), do: false
+
+  defp guardrail_summary_hold?(hold) when is_map(hold) do
+    guardrail_summary_entry?(hold) or not is_nil(Map.get(hold, :stop_reason))
+  end
+
+  defp guardrail_summary_hold?(_hold), do: false
+
+  defp format_active_guardrail_summary(entry, status) do
+    identifier = entry.identifier || entry.issue_id || "unknown"
+    guardrails = Map.get(entry, :guardrails, %{})
+    prompt_mode = Map.get(guardrails, :prompt_mode, "default")
+    policy_mode = Map.get(guardrails, :policy_mode, "observe")
+    warning = format_guardrail_warning(Map.get(guardrails, :warning))
+    budget = format_guardrail_budget_summary(Map.get(guardrails, :budget, %{}))
+
+    "│  " <>
+      colorize(identifier, @ansi_cyan) <>
+      " " <>
+      colorize("state=#{status}", @ansi_blue) <>
+      " " <>
+      colorize("prompt=#{prompt_mode}", @ansi_green) <>
+      " " <>
+      colorize("policy=#{policy_mode}", @ansi_yellow) <>
+      " " <>
+      colorize("warning=#{warning}", @ansi_magenta) <>
+      " " <>
+      colorize(budget, @ansi_dim)
+  end
+
+  defp format_hold_guardrail_summary(hold) do
+    identifier = hold.identifier || hold.issue_id || "unknown"
+    guardrails = Map.get(hold, :guardrails, %{})
+    prompt_mode = Map.get(guardrails, :prompt_mode, "default")
+    policy_mode = Map.get(guardrails, :policy_mode, "observe")
+    stop_reason = Map.get(hold, :stop_reason) || Map.get(guardrails, :stop_reason) || "unknown"
+    held_at = Map.get(hold, :held_at) || "unknown"
+    budget = format_guardrail_budget_summary(Map.get(guardrails, :budget, %{}))
+    writeback = format_guardrail_writeback(Map.get(hold, :writeback, %{}))
+
+    "│  " <>
+      colorize("HOLD", @ansi_red) <>
+      " " <>
+      colorize(identifier, @ansi_cyan) <>
+      " " <>
+      colorize("prompt=#{prompt_mode}", @ansi_green) <>
+      " " <>
+      colorize("policy=#{policy_mode}", @ansi_yellow) <>
+      " " <>
+      colorize("stop=#{stop_reason}", @ansi_red) <>
+      " " <>
+      colorize("held=#{held_at}", @ansi_magenta) <>
+      " " <>
+      colorize("writeback=#{writeback}", @ansi_gray) <>
+      " " <>
+      colorize(budget, @ansi_dim)
+  end
+
+  defp format_guardrail_warning(nil), do: "none"
+
+  defp format_guardrail_warning(%{} = warning) do
+    reason = Map.get(warning, :reason) || "unknown"
+
+    case Map.get(warning, :at) do
+      at when is_binary(at) and at != "" -> "#{reason}@#{at}"
+      _ -> reason
+    end
+  end
+
+  defp format_guardrail_warning(_warning), do: "unknown"
+
+  defp format_guardrail_budget_summary(budget) when is_map(budget) do
+    "total=#{format_guardrail_threshold(Map.get(budget, :total_tokens))} " <>
+      "input=#{format_guardrail_threshold(Map.get(budget, :input_tokens))} " <>
+      "turns=#{format_guardrail_limit_metric(Map.get(budget, :total_turns))} " <>
+      "cont=#{format_guardrail_limit_metric(Map.get(budget, :continuation_runs))} " <>
+      "noprog=#{format_guardrail_limit_metric(Map.get(budget, :no_progress_turns))}"
+  end
+
+  defp format_guardrail_budget_summary(_budget), do: "budget=unavailable"
+
+  defp format_guardrail_threshold(%{} = metric) do
+    [
+      format_count(Map.get(metric, :current, 0)),
+      format_guardrail_limit(Map.get(metric, :soft_limit)),
+      format_guardrail_limit(Map.get(metric, :hard_limit))
+    ]
+    |> Enum.join("/")
+  end
+
+  defp format_guardrail_threshold(_metric), do: "0/-/-"
+
+  defp format_guardrail_limit_metric(%{} = metric) do
+    "#{format_count(Map.get(metric, :current, 0))}/#{format_guardrail_limit(Map.get(metric, :limit))}"
+  end
+
+  defp format_guardrail_limit_metric(_metric), do: "0/-"
+
+  defp format_guardrail_limit(nil), do: "-"
+  defp format_guardrail_limit(value), do: format_count(value)
+
+  defp format_guardrail_writeback(writeback) when is_map(writeback) do
+    "comment=#{Map.get(writeback, "comment", "?")},state=#{Map.get(writeback, "state", "?")}"
+  end
+
+  defp format_guardrail_writeback(_writeback), do: "comment=?,state=?"
 
   defp format_runtime_seconds(seconds) when is_integer(seconds) do
     mins = div(seconds, 60)

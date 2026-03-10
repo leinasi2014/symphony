@@ -1061,10 +1061,14 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       issue_id: hold["issue_id"],
       identifier: hold["identifier"],
+      mode: Map.get(hold, "mode"),
       stop_reason: hold["stop_reason"],
       held_at: hold["held_at"],
       input_tokens: hold["input_tokens"] || 0,
       total_tokens: hold["total_tokens"] || 0,
+      total_turns: hold["total_turns"] || 0,
+      continuation_runs: hold["continuation_runs"] || 0,
+      no_progress_turns: hold["no_progress_turns"] || 0,
       writeback: Map.get(hold, "writeback", %{})
     }
   end
@@ -1076,10 +1080,14 @@ defmodule SymphonyElixir.Orchestrator do
     payload = %{
       issue_id: hold.issue_id,
       identifier: identifier,
+      mode: hold.mode,
       stop_reason: format_guardrail_reason(hold.stop_reason),
       held_at: hold.held_at,
       input_tokens: hold.input_tokens,
       total_tokens: hold.total_tokens,
+      total_turns: Map.get(hold, :total_turns, 0),
+      continuation_runs: Map.get(hold, :continuation_runs, 0),
+      no_progress_turns: Map.get(hold, :no_progress_turns, 0),
       writeback: hold.writeback
     }
 
@@ -1137,6 +1145,9 @@ defmodule SymphonyElixir.Orchestrator do
       held_at: DateTime.utc_now() |> DateTime.to_iso8601(),
       input_tokens: Map.get(ledger_entry, :total_input_tokens, 0),
       total_tokens: Map.get(ledger_entry, :total_tokens, 0),
+      total_turns: Map.get(ledger_entry, :total_turns, 0),
+      continuation_runs: Map.get(ledger_entry, :continuation_runs, 0),
+      no_progress_turns: Map.get(ledger_entry, :no_progress_turns, 0),
       writeback: %{}
     }
   end
@@ -1323,7 +1334,8 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          runtime_seconds: running_seconds(metadata.started_at, now),
+          guardrails: guardrail_snapshot(state, issue_id)
         }
       end)
 
@@ -1335,14 +1347,22 @@ defmodule SymphonyElixir.Orchestrator do
           attempt: attempt,
           due_in_ms: max(0, due_at_ms - now_ms),
           identifier: Map.get(retry, :identifier),
-          error: Map.get(retry, :error)
+          error: Map.get(retry, :error),
+          guardrails: guardrail_snapshot(state, issue_id)
         }
+      end)
+
+    guardrail_holds =
+      state.guardrail_holds
+      |> Enum.map(fn {issue_id, hold} ->
+        guardrail_hold_snapshot(state, issue_id, hold)
       end)
 
     {:reply,
      %{
        running: running,
        retrying: retrying,
+       guardrail_holds: guardrail_holds,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1716,6 +1736,110 @@ defmodule SymphonyElixir.Orchestrator do
   defp guardrail_budget_for_entry(_entry) do
     Config.guardrails_default_budget()
   end
+
+  defp guardrail_snapshot(%State{} = state, issue_id, hold \\ nil) when is_binary(issue_id) do
+    entry = Map.get(state.guardrail_ledger, issue_id, %{})
+    prompt_mode = guardrail_prompt_mode(Map.get(entry, :mode) || hold_mode(hold))
+    budget = guardrail_budget_for_snapshot(prompt_mode)
+    total_turns = Map.get(entry, :total_turns, hold_count(hold, :total_turns))
+    continuation_runs = Map.get(entry, :continuation_runs, hold_count(hold, :continuation_runs))
+    no_progress_turns = Map.get(entry, :no_progress_turns, hold_count(hold, :no_progress_turns))
+    total_input_tokens = Map.get(entry, :total_input_tokens, hold_count(hold, :input_tokens))
+    total_tokens = Map.get(entry, :total_tokens, hold_count(hold, :total_tokens))
+    stop_reason = Map.get(entry, :stop_reason) || hold_value(hold, :stop_reason)
+
+    %{
+      enabled: Config.guardrails_enabled?(),
+      prompt_mode: prompt_mode,
+      policy_mode: Config.guardrails_mode(),
+      stop_state: Config.guardrails_stop_state(),
+      warning: guardrail_warning_snapshot(entry),
+      stop_reason: guardrail_reason_snapshot(stop_reason),
+      counters: %{
+        total_turns: total_turns,
+        continuation_runs: continuation_runs,
+        no_progress_turns: no_progress_turns
+      },
+      budget: %{
+        total_tokens: %{
+          current: total_tokens,
+          soft_limit: Map.get(budget, :soft_total_tokens),
+          hard_limit: Map.get(budget, :hard_total_tokens)
+        },
+        input_tokens: %{
+          current: total_input_tokens,
+          soft_limit: Map.get(budget, :soft_input_tokens),
+          hard_limit: Map.get(budget, :hard_input_tokens)
+        },
+        total_turns: %{
+          current: total_turns,
+          limit: Map.get(budget, :max_total_turns_per_issue)
+        },
+        continuation_runs: %{
+          current: continuation_runs,
+          limit: Map.get(budget, :max_continuation_runs_per_issue)
+        },
+        no_progress_turns: %{
+          current: no_progress_turns,
+          limit: Map.get(budget, :no_progress_turn_limit)
+        }
+      }
+    }
+  end
+
+  defp guardrail_hold_snapshot(%State{} = state, issue_id, hold) do
+    %{
+      issue_id: issue_id,
+      identifier: Map.get(hold, :identifier, issue_id),
+      held_at: snapshot_timestamp(Map.get(hold, :held_at)),
+      stop_reason: guardrail_reason_snapshot(Map.get(hold, :stop_reason)),
+      writeback: Map.get(hold, :writeback, %{}),
+      guardrails: guardrail_snapshot(state, issue_id, hold)
+    }
+  end
+
+  defp guardrail_warning_snapshot(entry) when is_map(entry) do
+    case Map.get(entry, :last_guardrail_reason) do
+      nil ->
+        nil
+
+      reason ->
+        %{
+          reason: guardrail_reason_snapshot(reason),
+          at: snapshot_timestamp(Map.get(entry, :last_warning_at))
+        }
+    end
+  end
+
+  defp guardrail_warning_snapshot(_entry), do: nil
+
+  defp guardrail_budget_for_snapshot("probe"), do: Config.guardrails_probe_budget()
+  defp guardrail_budget_for_snapshot(_mode), do: Config.guardrails_default_budget()
+
+  defp guardrail_prompt_mode(:probe), do: "probe"
+  defp guardrail_prompt_mode("probe"), do: "probe"
+  defp guardrail_prompt_mode(_mode), do: "default"
+
+  defp guardrail_reason_snapshot(nil), do: nil
+  defp guardrail_reason_snapshot(reason), do: format_guardrail_reason(reason)
+
+  defp hold_mode(hold), do: hold_value(hold, :mode)
+
+  defp hold_count(hold, key) when is_atom(key) do
+    hold_value(hold, key) || 0
+  end
+
+  defp hold_value(hold, key) when is_map(hold) and is_atom(key), do: Map.get(hold, key)
+  defp hold_value(_hold, _key), do: nil
+
+  defp snapshot_timestamp(%DateTime{} = datetime) do
+    datetime
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  defp snapshot_timestamp(value) when is_binary(value), do: value
+  defp snapshot_timestamp(_value), do: nil
 
   defp maybe_seed_progress_baseline(%State{} = state, issue_id, %{workspace: workspace}, update)
        when is_binary(workspace) do

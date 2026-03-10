@@ -101,6 +101,122 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator snapshot exposes guardrail counters warnings and holds" do
+    issue_id = "issue-guardrail-snapshot"
+    retry_issue_id = "issue-guardrail-retry"
+    held_issue_id = "issue-guardrail-held"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-GUARD",
+      title: "Guardrail snapshot test",
+      description: "Capture guardrail state",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-GUARD"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :GuardrailSnapshotOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+    warning_at = ~U[2026-03-10 12:01:00Z]
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-guard",
+      turn_count: 1,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 18_000,
+      codex_output_tokens: 8_000,
+      codex_total_tokens: 26_000,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: started_at
+    }
+
+    now_ms = System.monotonic_time(:millisecond)
+
+    state_with_guardrails =
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:retry_attempts, %{
+        retry_issue_id => %{
+          attempt: 2,
+          due_at_ms: now_ms + 1_000,
+          identifier: "MT-RETRY-GUARD",
+          error: "boom"
+        }
+      })
+      |> Map.put(:guardrail_ledger, %{
+        issue_id => %{
+          issue_identifier: issue.identifier,
+          mode: :probe,
+          total_input_tokens: 18_000,
+          total_tokens: 26_000,
+          total_turns: 1,
+          continuation_runs: 0,
+          no_progress_turns: 0,
+          last_warning_at: warning_at,
+          last_guardrail_reason: :soft_total_tokens
+        },
+        retry_issue_id => %{
+          issue_identifier: "MT-RETRY-GUARD",
+          mode: :default,
+          total_input_tokens: 60_000,
+          total_tokens: 80_000,
+          total_turns: 2,
+          continuation_runs: 1,
+          no_progress_turns: 0
+        }
+      })
+      |> Map.put(:guardrail_holds, %{
+        held_issue_id => %{
+          issue_id: held_issue_id,
+          identifier: "MT-HOLD",
+          mode: :default,
+          stop_reason: :max_total_turns_per_issue,
+          held_at: "2026-03-10T12:03:00Z",
+          input_tokens: 151_000,
+          total_tokens: 181_000,
+          total_turns: 3,
+          continuation_runs: 2,
+          no_progress_turns: 1,
+          writeback: %{"comment" => "ok", "state" => "ok"}
+        }
+      })
+
+    :sys.replace_state(pid, fn _ -> state_with_guardrails end)
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert [%{issue_id: ^issue_id, guardrails: running_guardrails}] = snapshot.running
+    assert running_guardrails.prompt_mode == "probe"
+    assert running_guardrails.warning == %{reason: "soft_total_tokens", at: "2026-03-10T12:01:00Z"}
+    assert running_guardrails.budget.total_tokens == %{current: 26_000, soft_limit: 25_000, hard_limit: 50_000}
+
+    assert [%{issue_id: ^retry_issue_id, guardrails: retry_guardrails}] = snapshot.retrying
+    assert retry_guardrails.prompt_mode == "default"
+    assert retry_guardrails.budget.continuation_runs == %{current: 1, limit: 2}
+
+    assert [%{issue_id: ^held_issue_id, identifier: "MT-HOLD", stop_reason: "max_total_turns_per_issue", guardrails: held_guardrails}] =
+             snapshot.guardrail_holds
+
+    assert held_guardrails.stop_reason == "max_total_turns_per_issue"
+    assert held_guardrails.budget.no_progress_turns == %{current: 1, limit: 1}
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -1282,6 +1398,101 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
     assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ 退避队列/s
+  end
+
+  test "status dashboard renders running budgets warnings and held guardrail stops" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [
+           %{
+             identifier: "MT-777",
+             state: "running",
+             session_id: "thread-1234567890",
+             codex_app_server_pid: "4242",
+             codex_total_tokens: 26_000,
+             runtime_seconds: 75,
+             turn_count: 1,
+             last_codex_event: "turn_completed",
+             last_codex_message: %{
+               event: :notification,
+               message: %{
+                 "method" => "turn/completed",
+                 "params" => %{"turn" => %{"status" => "completed"}}
+               }
+             },
+             guardrails: %{
+               prompt_mode: "probe",
+               policy_mode: "enforce",
+               warning: %{reason: "soft_total_tokens", at: "2026-03-10T12:01:00Z"},
+               budget: %{
+                 total_tokens: %{current: 26_000, soft_limit: 25_000, hard_limit: 50_000},
+                 input_tokens: %{current: 18_000, soft_limit: 20_000, hard_limit: 40_000},
+                 total_turns: %{current: 1, limit: 1},
+                 continuation_runs: %{current: 0, limit: nil},
+                 no_progress_turns: %{current: 0, limit: nil}
+               }
+             }
+           }
+         ],
+         retrying: [
+           %{
+             issue_id: "issue-retry",
+             identifier: "MT-RETRY",
+             attempt: 2,
+             due_in_ms: 1_000,
+             error: "boom",
+             guardrails: %{
+               prompt_mode: "default",
+               policy_mode: "enforce",
+               warning: nil,
+               budget: %{
+                 total_tokens: %{current: 80_000, soft_limit: 120_000, hard_limit: 180_000},
+                 input_tokens: %{current: 60_000, soft_limit: 100_000, hard_limit: 150_000},
+                 total_turns: %{current: 2, limit: 3},
+                 continuation_runs: %{current: 1, limit: 2},
+                 no_progress_turns: %{current: 0, limit: 1}
+               }
+             }
+           }
+         ],
+         guardrail_holds: [
+           %{
+             issue_id: "issue-held",
+             identifier: "MT-HOLD",
+             held_at: "2026-03-10T12:03:00Z",
+             stop_reason: "max_total_turns_per_issue",
+             writeback: %{"comment" => "ok", "state" => "ok"},
+             guardrails: %{
+               prompt_mode: "default",
+               policy_mode: "enforce",
+               stop_reason: "max_total_turns_per_issue",
+               budget: %{
+                 total_tokens: %{current: 181_000, soft_limit: 120_000, hard_limit: 180_000},
+                 input_tokens: %{current: 151_000, soft_limit: 100_000, hard_limit: 150_000},
+                 total_turns: %{current: 3, limit: 3},
+                 continuation_runs: %{current: 2, limit: 2},
+                 no_progress_turns: %{current: 1, limit: 1}
+               }
+             }
+           }
+         ],
+         codex_totals: %{input_tokens: 18_000, output_tokens: 8_000, total_tokens: 26_000, seconds_running: 75},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+    plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
+
+    assert plain =~ "├─ Guardrails"
+    assert plain =~ "MT-777 state=running prompt=probe policy=enforce"
+    assert plain =~ "warning=soft_total_tokens@2026-03-10T12:01:00Z"
+    assert plain =~ "total=26,000/25,000/50,000"
+    assert plain =~ "MT-RETRY state=retrying prompt=default policy=enforce"
+    assert plain =~ "cont=1/2"
+    assert plain =~ "HOLD MT-HOLD"
+    assert plain =~ "stop=max_total_turns_per_issue"
+    assert plain =~ "writeback=comment=ok,state=ok"
   end
 
   test "status dashboard renders an unstyled closing corner when the retry queue is empty" do

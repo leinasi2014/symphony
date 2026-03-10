@@ -11,14 +11,18 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
+        guardrail_holds = Map.get(snapshot, :guardrail_holds, [])
+
         %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
-            retrying: length(snapshot.retrying)
+            retrying: length(snapshot.retrying),
+            held: length(guardrail_holds)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          guardrail_holds: Enum.map(guardrail_holds, &guardrail_hold_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -37,11 +41,12 @@ defmodule SymphonyElixirWeb.Presenter do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
+        hold = snapshot |> Map.get(:guardrail_holds, []) |> Enum.find(&(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) do
+        if is_nil(running) and is_nil(retry) and is_nil(hold) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry)}
+          {:ok, issue_payload_body(issue_identifier, running, retry, hold)}
         end
 
       _ ->
@@ -60,11 +65,11 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry) do
+  defp issue_payload_body(issue_identifier, running, retry, hold) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry),
-      status: issue_status(running, retry),
+      issue_id: issue_id_from_entries(running, retry, hold),
+      status: issue_status(running, retry, hold),
       workspace: %{
         path: Path.join(Config.workspace_root(), issue_identifier)
       },
@@ -74,6 +79,8 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
+      guardrails: issue_guardrails(running, retry, hold),
+      guardrail_hold: hold && guardrail_hold_payload(hold),
       logs: %{
         codex_session_logs: []
       },
@@ -83,16 +90,19 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp issue_id_from_entries(running, retry),
-    do: (running && running.issue_id) || (retry && retry.issue_id)
+  defp issue_id_from_entries(running, retry, hold),
+    do: (running && running.issue_id) || (retry && retry.issue_id) || (hold && hold.issue_id)
+
+  defp issue_guardrails(running, retry, hold),
+    do: (running && Map.get(running, :guardrails)) || (retry && Map.get(retry, :guardrails)) || (hold && Map.get(hold, :guardrails))
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(_running, nil), do: "running"
-  defp issue_status(nil, _retry), do: "retrying"
-  defp issue_status(_running, _retry), do: "running"
+  defp issue_status(running, _retry, _hold) when not is_nil(running), do: "running"
+  defp issue_status(nil, retry, _hold) when not is_nil(retry), do: "retrying"
+  defp issue_status(nil, nil, _hold), do: "held"
 
   defp running_entry_payload(entry) do
     %{
@@ -109,7 +119,8 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
-      }
+      },
+      guardrails: Map.get(entry, :guardrails)
     }
   end
 
@@ -119,7 +130,8 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_identifier: entry.identifier,
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
-      error: entry.error
+      error: entry.error,
+      guardrails: Map.get(entry, :guardrails)
     }
   end
 
@@ -136,7 +148,8 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
-      }
+      },
+      guardrails: Map.get(running, :guardrails)
     }
   end
 
@@ -144,7 +157,19 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       attempt: retry.attempt,
       due_at: due_at_iso8601(retry.due_in_ms),
-      error: retry.error
+      error: retry.error,
+      guardrails: Map.get(retry, :guardrails)
+    }
+  end
+
+  defp guardrail_hold_payload(hold) do
+    %{
+      issue_id: hold.issue_id,
+      issue_identifier: hold.identifier,
+      held_at: hold.held_at,
+      stop_reason: hold.stop_reason,
+      writeback: Map.get(hold, :writeback, %{}),
+      guardrails: Map.get(hold, :guardrails)
     }
   end
 
