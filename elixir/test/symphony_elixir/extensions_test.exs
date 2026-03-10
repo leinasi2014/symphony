@@ -493,6 +493,26 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
+  test "phoenix observability api prefers held status when a running issue is already guardrail-held" do
+    snapshot = guardrail_snapshot_with_running_hold()
+    orchestrator_name = Module.concat(__MODULE__, :GuardrailHeldPriorityOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{queued: true, coalesced: false, requested_at: DateTime.utc_now(), operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    payload = json_response(get(build_conn(), "/api/v1/MT-HOLD-LIVE"), 200)
+
+    assert payload["status"] == "held"
+    assert payload["running"]["session_id"] == "thread-held-live"
+    assert payload["guardrail_hold"]["stop_reason"] == "hard_total_token_limit"
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)
@@ -868,6 +888,72 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 18_000, output_tokens: 8_000, total_tokens: 26_000, seconds_running: 123},
+      rate_limits: %{"primary" => %{"remaining" => 11}}
+    }
+  end
+
+  defp guardrail_snapshot_with_running_hold do
+    %{
+      running: [
+        %{
+          issue_id: "issue-held-live",
+          identifier: "MT-HOLD-LIVE",
+          state: "In Progress",
+          session_id: "thread-held-live",
+          turn_count: 2,
+          codex_app_server_pid: nil,
+          last_codex_message: "stopping",
+          last_codex_timestamp: nil,
+          last_codex_event: :notification,
+          codex_input_tokens: 151_000,
+          codex_output_tokens: 30_000,
+          codex_total_tokens: 181_000,
+          started_at: DateTime.utc_now(),
+          guardrails: %{
+            enabled: true,
+            prompt_mode: "default",
+            policy_mode: "enforce",
+            stop_state: "Human Review",
+            warning: %{"reason" => "hard_total_token_limit", "at" => "2026-03-10T12:03:00Z"},
+            stop_reason: "hard_total_token_limit",
+            counters: %{"total_turns" => 2, "continuation_runs" => 1, "no_progress_turns" => 0},
+            budget: %{
+              "total_tokens" => %{"current" => 181_000, "soft_limit" => 120_000, "hard_limit" => 180_000},
+              "input_tokens" => %{"current" => 151_000, "soft_limit" => 100_000, "hard_limit" => 150_000},
+              "total_turns" => %{"current" => 2, "limit" => 3},
+              "continuation_runs" => %{"current" => 1, "limit" => 2},
+              "no_progress_turns" => %{"current" => 0, "limit" => 1}
+            }
+          }
+        }
+      ],
+      retrying: [],
+      guardrail_holds: [
+        %{
+          issue_id: "issue-held-live",
+          identifier: "MT-HOLD-LIVE",
+          held_at: "2026-03-10T12:03:00Z",
+          stop_reason: "hard_total_token_limit",
+          writeback: %{"comment" => "ok", "state" => "ok"},
+          guardrails: %{
+            enabled: true,
+            prompt_mode: "default",
+            policy_mode: "enforce",
+            stop_state: "Human Review",
+            warning: nil,
+            stop_reason: "hard_total_token_limit",
+            counters: %{"total_turns" => 2, "continuation_runs" => 1, "no_progress_turns" => 0},
+            budget: %{
+              "total_tokens" => %{"current" => 181_000, "soft_limit" => 120_000, "hard_limit" => 180_000},
+              "input_tokens" => %{"current" => 151_000, "soft_limit" => 100_000, "hard_limit" => 150_000},
+              "total_turns" => %{"current" => 2, "limit" => 3},
+              "continuation_runs" => %{"current" => 1, "limit" => 2},
+              "no_progress_turns" => %{"current" => 0, "limit" => 1}
+            }
+          }
+        }
+      ],
+      codex_totals: %{input_tokens: 151_000, output_tokens: 30_000, total_tokens: 181_000, seconds_running: 123},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
   end

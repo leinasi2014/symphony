@@ -40,6 +40,7 @@ defmodule SymphonyElixir.PromptBuilder do
   end
 
   defp build_continuation_summary_prompt(issue, opts) do
+    initial_prompt = build_initial_prompt(issue, opts)
     issue_identifier = issue.identifier || "unknown"
     issue_title = issue.title || "Untitled"
     issue_state = issue.state || "unknown"
@@ -50,7 +51,9 @@ defmodule SymphonyElixir.PromptBuilder do
     guardrail_state_path = Keyword.get(opts, :guardrail_state_path, Path.join("shared", "guardrail_state.json"))
 
     """
-    Continuation summary:
+    #{initial_prompt}
+
+    Fresh-session continuation summary:
 
     - Issue: #{issue_identifier} #{issue_title}
     - Current Linear state: #{issue_state}

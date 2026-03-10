@@ -100,9 +100,10 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(running, _retry, _hold) when not is_nil(running), do: "running"
-  defp issue_status(nil, retry, _hold) when not is_nil(retry), do: "retrying"
-  defp issue_status(nil, nil, _hold), do: "held"
+  defp issue_status(_running, _retry, hold) when not is_nil(hold), do: "held"
+  defp issue_status(running, _retry, nil) when not is_nil(running), do: "running"
+  defp issue_status(nil, retry, nil) when not is_nil(retry), do: "retrying"
+  defp issue_status(nil, nil, nil), do: "held"
 
   defp running_entry_payload(entry) do
     %{

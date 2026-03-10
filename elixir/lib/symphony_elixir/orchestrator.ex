@@ -49,7 +49,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @spec request_continuation(GenServer.server(), String.t(), pos_integer()) ::
-          {:allow, :probe | :default, :reuse_thread | :fresh_summary, Issue.t()} | {:deny, term()}
+          {:allow, :probe | :default, :reuse_thread | :fresh_summary, Issue.t(), map()} | {:deny, term()}
   def request_continuation(server, issue_id, turn_number)
       when is_binary(issue_id) and is_integer(turn_number) and turn_number > 0 do
     request_continuation(server, issue_id, turn_number, &Tracker.fetch_issue_states_by_ids/1)
@@ -62,7 +62,7 @@ defmodule SymphonyElixir.Orchestrator do
           pos_integer(),
           ([String.t()] -> term())
         ) ::
-          {:allow, :probe | :default, :reuse_thread | :fresh_summary, Issue.t()} | {:deny, term()}
+          {:allow, :probe | :default, :reuse_thread | :fresh_summary, Issue.t(), map()} | {:deny, term()}
   def request_continuation_for_test(server, issue_id, turn_number, issue_fetcher)
       when is_binary(issue_id) and is_integer(turn_number) and turn_number > 0 and
              is_function(issue_fetcher, 1) do
@@ -1067,6 +1067,9 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id: hold["issue_id"],
       identifier: hold["identifier"],
       mode: Map.get(hold, "mode"),
+      policy_mode: Map.get(hold, "policy_mode"),
+      stop_state: Map.get(hold, "stop_state"),
+      budget: decoded_guardrail_budget(Map.get(hold, "budget")),
       stop_reason: hold["stop_reason"],
       held_at: hold["held_at"],
       input_tokens: hold["input_tokens"] || 0,
@@ -1078,6 +1081,20 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp decoded_guardrail_budget(budget) when is_map(budget) do
+    %{
+      soft_total_tokens: Map.get(budget, "soft_total_tokens"),
+      hard_total_tokens: Map.get(budget, "hard_total_tokens"),
+      soft_input_tokens: Map.get(budget, "soft_input_tokens"),
+      hard_input_tokens: Map.get(budget, "hard_input_tokens"),
+      max_total_turns_per_issue: Map.get(budget, "max_total_turns_per_issue"),
+      max_continuation_runs_per_issue: Map.get(budget, "max_continuation_runs_per_issue"),
+      no_progress_turn_limit: Map.get(budget, "no_progress_turn_limit")
+    }
+  end
+
+  defp decoded_guardrail_budget(_budget), do: nil
+
   defp persist_guardrail_hold(%{identifier: identifier} = hold) when is_binary(identifier) do
     shared_dir = Path.join(Workspace.path_for_issue(identifier), "shared")
     File.mkdir_p!(shared_dir)
@@ -1087,6 +1104,9 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id: hold.issue_id,
       identifier: identifier,
       mode: hold.mode,
+      policy_mode: hold.policy_mode,
+      stop_state: hold.stop_state,
+      budget: hold.budget,
       stop_reason: format_guardrail_reason(hold.stop_reason),
       held_at: hold.held_at,
       input_tokens: hold.input_tokens,
@@ -1156,6 +1176,9 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id: issue_id,
       identifier: identifier,
       mode: Map.get(ledger_entry, :mode, initial_guardrail_mode()),
+      policy_mode: Config.guardrails_mode(),
+      stop_state: Config.guardrails_stop_state(),
+      budget: guardrail_budget_snapshot(guardrail_budget_for_entry(ledger_entry)),
       stop_reason: reason,
       held_at: DateTime.utc_now() |> DateTime.to_iso8601(),
       input_tokens: Map.get(ledger_entry, :total_input_tokens, 0),
@@ -1204,6 +1227,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp format_guardrail_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp format_guardrail_reason(reason) when is_binary(reason), do: reason
   defp format_guardrail_reason(reason), do: inspect(reason)
 
   defp release_issue_claim(%State{} = state, issue_id) do
@@ -1467,13 +1491,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp allow_continuation(%State{} = state, issue_id, %Issue{} = refreshed_issue) do
+    mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
+    session_strategy = continuation_session_strategy(state.guardrail_ledger, issue_id)
+    continuation_context = continuation_context_for_issue(state.guardrail_ledger, issue_id, session_strategy)
+
     state =
       state
       |> update_running_issue_if_present(refreshed_issue)
       |> then(fn updated_state ->
-        mode = ledger_mode_for_issue(updated_state.guardrail_ledger, issue_id)
-        session_strategy = continuation_session_strategy(updated_state.guardrail_ledger, issue_id)
-
         update_guardrail_ledger(updated_state, issue_id, fn entry ->
           entry
           |> Map.put(:stop_reason, nil)
@@ -1482,9 +1507,7 @@ defmodule SymphonyElixir.Orchestrator do
         end)
       end)
 
-    mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
-    session_strategy = continuation_session_strategy(state.guardrail_ledger, issue_id)
-    {{:allow, mode, session_strategy, refreshed_issue}, state}
+    {{:allow, mode, session_strategy, refreshed_issue, continuation_context}, state}
   end
 
   defp update_running_issue_if_present(%State{} = state, %Issue{} = issue) do
@@ -1770,27 +1793,82 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp continuation_session_strategy(_guardrail_ledger, _issue_id), do: :reuse_thread
 
+  defp continuation_context_for_issue(guardrail_ledger, issue_id, session_strategy)
+       when is_map(guardrail_ledger) and session_strategy in [:reuse_thread, :fresh_summary] do
+    case Map.get(guardrail_ledger, issue_id) do
+      %{} = entry ->
+        budget = guardrail_budget_for_entry(entry)
+
+        %{
+          session_strategy: session_strategy,
+          prompt_mode: if(session_strategy == :fresh_summary, do: :continuation_summary, else: :reuse_thread),
+          mode: Map.get(entry, :mode, initial_guardrail_mode()),
+          risk_reason: continuation_risk_reason(entry, budget),
+          counters: %{
+            total_turns: Map.get(entry, :total_turns, 0),
+            continuation_runs: Map.get(entry, :continuation_runs, 0),
+            no_progress_turns: Map.get(entry, :no_progress_turns, 0)
+          },
+          budget: guardrail_budget_snapshot(budget),
+          usage: %{
+            input_tokens: Map.get(entry, :total_input_tokens, 0),
+            output_tokens: Map.get(entry, :total_output_tokens, 0),
+            total_tokens: Map.get(entry, :total_tokens, 0)
+          }
+        }
+
+      _ ->
+        %{
+          session_strategy: session_strategy,
+          prompt_mode: if(session_strategy == :fresh_summary, do: :continuation_summary, else: :reuse_thread)
+        }
+    end
+  end
+
+  defp continuation_context_for_issue(_guardrail_ledger, _issue_id, session_strategy) do
+    %{
+      session_strategy: session_strategy,
+      prompt_mode: if(session_strategy == :fresh_summary, do: :continuation_summary, else: :reuse_thread)
+    }
+  end
+
   defp fresh_summary_continuation?(entry) when is_map(entry) do
     if Config.guardrails_enabled?() do
       budget = guardrail_budget_for_entry(entry)
-      total_tokens = Map.get(entry, :total_tokens, 0)
-      input_tokens = Map.get(entry, :total_input_tokens, 0)
-      soft_total_tokens = Map.get(budget, :soft_total_tokens, 9_223_372_036_854_775_807)
-      soft_input_tokens = Map.get(budget, :soft_input_tokens, 9_223_372_036_854_775_807)
-
-      total_tokens >= soft_total_tokens or
-        input_tokens >= soft_input_tokens or
-        not is_nil(Map.get(entry, :last_guardrail_reason)) or
-        not is_nil(Map.get(entry, :stop_reason))
+      not is_nil(continuation_risk_reason(entry, budget))
     else
       false
+    end
+  end
+
+  defp continuation_risk_reason(entry, budget) when is_map(entry) and is_map(budget) do
+    total_tokens = Map.get(entry, :total_tokens, 0)
+    input_tokens = Map.get(entry, :total_input_tokens, 0)
+    soft_total_tokens = Map.get(budget, :soft_total_tokens, 9_223_372_036_854_775_807)
+    soft_input_tokens = Map.get(budget, :soft_input_tokens, 9_223_372_036_854_775_807)
+
+    cond do
+      not is_nil(Map.get(entry, :stop_reason)) ->
+        Map.get(entry, :stop_reason)
+
+      not is_nil(Map.get(entry, :last_guardrail_reason)) ->
+        Map.get(entry, :last_guardrail_reason)
+
+      total_tokens >= soft_total_tokens ->
+        :soft_total_tokens
+
+      input_tokens >= soft_input_tokens ->
+        :soft_input_tokens
+
+      true ->
+        nil
     end
   end
 
   defp guardrail_snapshot(%State{} = state, issue_id, hold \\ nil) when is_binary(issue_id) do
     entry = Map.get(state.guardrail_ledger, issue_id, %{})
     prompt_mode = guardrail_prompt_mode(Map.get(entry, :mode) || hold_mode(hold))
-    budget = guardrail_budget_for_snapshot(prompt_mode)
+    budget = hold_budget(hold) || guardrail_budget_for_snapshot(prompt_mode)
     total_turns = Map.get(entry, :total_turns, hold_count(hold, :total_turns))
     continuation_runs = Map.get(entry, :continuation_runs, hold_count(hold, :continuation_runs))
     no_progress_turns = Map.get(entry, :no_progress_turns, hold_count(hold, :no_progress_turns))
@@ -1799,10 +1877,10 @@ defmodule SymphonyElixir.Orchestrator do
     stop_reason = Map.get(entry, :stop_reason) || hold_value(hold, :stop_reason)
 
     %{
-      enabled: Config.guardrails_enabled?(),
+      enabled: guardrails_enabled_for_snapshot(hold),
       prompt_mode: prompt_mode,
-      policy_mode: Config.guardrails_mode(),
-      stop_state: Config.guardrails_stop_state(),
+      policy_mode: hold_value(hold, :policy_mode) || Config.guardrails_mode(),
+      stop_state: hold_value(hold, :stop_state) || Config.guardrails_stop_state(),
       warning: guardrail_warning_snapshot(entry),
       stop_reason: guardrail_reason_snapshot(stop_reason),
       counters: %{
@@ -1874,9 +1952,26 @@ defmodule SymphonyElixir.Orchestrator do
   defp guardrail_reason_snapshot(reason), do: format_guardrail_reason(reason)
 
   defp hold_mode(hold), do: hold_value(hold, :mode)
+  defp hold_budget(hold), do: hold_value(hold, :budget)
+
+  defp guardrails_enabled_for_snapshot(hold) do
+    if is_map(hold), do: true, else: Config.guardrails_enabled?()
+  end
 
   defp hold_count(hold, key) when is_atom(key) do
     hold_value(hold, key) || 0
+  end
+
+  defp guardrail_budget_snapshot(budget) when is_map(budget) do
+    %{
+      soft_total_tokens: Map.get(budget, :soft_total_tokens),
+      hard_total_tokens: Map.get(budget, :hard_total_tokens),
+      soft_input_tokens: Map.get(budget, :soft_input_tokens),
+      hard_input_tokens: Map.get(budget, :hard_input_tokens),
+      max_total_turns_per_issue: Map.get(budget, :max_total_turns_per_issue),
+      max_continuation_runs_per_issue: Map.get(budget, :max_continuation_runs_per_issue),
+      no_progress_turn_limit: Map.get(budget, :no_progress_turn_limit)
+    }
   end
 
   defp hold_value(hold, key) when is_map(hold) and is_atom(key), do: Map.get(hold, key)

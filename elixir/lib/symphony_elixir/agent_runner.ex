@@ -110,8 +110,9 @@ defmodule SymphonyElixir.AgentRunner do
          turn_number,
          max_turns
        ) do
-    :ok = write_continuation_artifacts(workspace, issue, turn_number, max_turns)
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, workspace)
+    continuation_state = Keyword.get(opts, :continuation_state, %{strategy: :reuse_thread, context: %{}})
+    :ok = write_continuation_artifacts(workspace, issue, turn_number, max_turns, continuation_state)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, workspace, continuation_state)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -122,8 +123,9 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continuation_decider.(issue, turn_number) do
-        {:allow, _mode, :reuse_thread, %Issue{} = refreshed_issue} when turn_number < max_turns ->
+      case normalize_continuation_decision(continuation_decider.(issue, turn_number)) do
+        {:allow, _mode, :reuse_thread, %Issue{} = refreshed_issue, continuation_context}
+        when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after orchestrator approval turn=#{turn_number}/#{max_turns}")
 
           do_run_codex_turns(
@@ -131,13 +133,14 @@ defmodule SymphonyElixir.AgentRunner do
             workspace,
             refreshed_issue,
             codex_update_recipient,
-            opts,
+            Keyword.put(opts, :continuation_state, %{strategy: :reuse_thread, context: continuation_context}),
             continuation_decider,
             turn_number + 1,
             max_turns
           )
 
-        {:allow, _mode, :fresh_summary, %Issue{} = refreshed_issue} when turn_number < max_turns ->
+        {:allow, _mode, :fresh_summary, %Issue{} = refreshed_issue, continuation_context}
+        when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} with a fresh summary session turn=#{turn_number}/#{max_turns}")
 
           AppServer.stop_session(app_session)
@@ -149,7 +152,7 @@ defmodule SymphonyElixir.AgentRunner do
                 workspace,
                 refreshed_issue,
                 codex_update_recipient,
-                opts,
+                Keyword.put(opts, :continuation_state, %{strategy: :fresh_summary, context: continuation_context}),
                 continuation_decider,
                 turn_number + 1,
                 max_turns
@@ -159,31 +162,17 @@ defmodule SymphonyElixir.AgentRunner do
             end
           end
 
-        {:allow, _mode, %Issue{} = refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after orchestrator approval turn=#{turn_number}/#{max_turns}")
-
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            continuation_decider,
-            turn_number + 1,
-            max_turns
-          )
-
-        {:allow, _mode, :reuse_thread, %Issue{} = refreshed_issue} ->
+        {:allow, _mode, :reuse_thread, %Issue{} = refreshed_issue, _continuation_context} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
           :ok
 
-        {:allow, _mode, :fresh_summary, %Issue{} = refreshed_issue} ->
+        {:allow, _mode, :fresh_summary, %Issue{} = refreshed_issue, _continuation_context} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
           :ok
 
-        {:allow, _mode, %Issue{} = refreshed_issue} ->
+        {:allow, _mode, %Issue{} = refreshed_issue, _continuation_context} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
           :ok
@@ -200,11 +189,11 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns, _workspace) do
+  defp build_turn_prompt(issue, opts, 1, _max_turns, _workspace, _continuation_state) do
     PromptBuilder.build_prompt(issue, Keyword.put(opts, :prompt_mode, :initial))
   end
 
-  defp build_turn_prompt(issue, opts, turn_number, max_turns, _workspace) do
+  defp build_turn_prompt(issue, opts, turn_number, max_turns, _workspace, %{strategy: :fresh_summary}) do
     PromptBuilder.build_prompt(
       issue,
       opts
@@ -214,6 +203,18 @@ defmodule SymphonyElixir.AgentRunner do
       |> Keyword.put_new(:context_summary_path, Path.join("shared", "context_summary.md"))
       |> Keyword.put_new(:guardrail_state_path, Path.join("shared", "guardrail_state.json"))
     )
+  end
+
+  defp build_turn_prompt(_issue, _opts, turn_number, max_turns, _workspace, _continuation_state) do
+    """
+    Continuation guidance:
+
+    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
+    - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
+    - Resume from the current workspace and workpad state instead of restarting from scratch.
+    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    """
   end
 
   defp default_continuation_decider(recipient, issue_state_fetcher) when is_pid(recipient) do
@@ -237,7 +238,7 @@ defmodule SymphonyElixir.AgentRunner do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state) do
-          {:allow, :default, refreshed_issue}
+          {:allow, :default, :reuse_thread, refreshed_issue, %{session_strategy: :reuse_thread}}
         else
           {:deny, :issue_not_active}
         end
@@ -252,47 +253,37 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp fallback_continuation_decision(_issue, _issue_state_fetcher), do: {:deny, :issue_not_active}
 
-  defp write_continuation_artifacts(workspace, issue, turn_number, max_turns)
-       when is_binary(workspace) and is_integer(turn_number) and turn_number > 0 do
+  defp write_continuation_artifacts(workspace, issue, turn_number, max_turns, continuation_state)
+       when is_binary(workspace) and is_integer(turn_number) and turn_number > 0 and is_map(continuation_state) do
     shared_dir = Path.join(workspace, "shared")
     File.mkdir_p!(shared_dir)
 
-    prompt_mode =
-      if turn_number == 1 do
-        :initial
-      else
-        :continuation_summary
-      end
+    prompt_mode = continuation_prompt_mode(turn_number, continuation_state)
 
     context_summary_path = Path.join(shared_dir, "context_summary.md")
     guardrail_state_path = Path.join(shared_dir, "guardrail_state.json")
 
-    File.write!(context_summary_path, build_context_summary(issue, prompt_mode, turn_number, max_turns))
+    artifact_payload =
+      continuation_artifact_payload(
+        issue,
+        prompt_mode,
+        turn_number,
+        max_turns,
+        continuation_state,
+        Path.join("shared", "context_summary.md")
+      )
 
     File.write!(
-      guardrail_state_path,
-      Jason.encode!(
-        %{
-          kind: "continuation_artifact",
-          generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
-          issue_id: issue.id,
-          identifier: issue.identifier,
-          title: issue.title,
-          state: issue.state,
-          url: issue.url,
-          prompt_mode: Atom.to_string(prompt_mode),
-          turn_number: turn_number,
-          max_turns: max_turns,
-          context_summary_path: Path.join("shared", "context_summary.md")
-        },
-        pretty: true
-      )
+      context_summary_path,
+      build_context_summary(issue, prompt_mode, turn_number, max_turns, artifact_payload)
     )
+
+    write_guardrail_artifact(guardrail_state_path, artifact_payload)
 
     :ok
   end
 
-  defp build_context_summary(issue, prompt_mode, turn_number, max_turns) do
+  defp build_context_summary(issue, prompt_mode, turn_number, max_turns, artifact_payload) do
     """
     # Context Summary
 
@@ -307,14 +298,96 @@ defmodule SymphonyElixir.AgentRunner do
 
     #{issue.description || "No description provided."}
 
+    ## Guardrail Context
+
+    - Session strategy: #{get_in(artifact_payload, [:guardrails, :session_strategy]) || "reuse_thread"}
+    - Risk reason: #{get_in(artifact_payload, [:guardrails, :risk_reason]) || "none"}
+
     ## Resume Guidance
 
-    - Resume from the current workspace state instead of assuming old thread history is available.
+    - #{resume_guidance_line(prompt_mode)}
     - Read `shared/guardrail_state.json` before acting.
     - Focus only on the remaining ticket work for this issue.
     """
     |> String.trim()
   end
+
+  defp resume_guidance_line(:continuation_summary),
+    do: "Resume from the current workspace state instead of assuming old thread history is available."
+
+  defp resume_guidance_line(_prompt_mode),
+    do: "Resume from the current workspace state and current thread context."
+
+  defp continuation_prompt_mode(1, _continuation_state), do: :initial
+  defp continuation_prompt_mode(_turn_number, %{strategy: :fresh_summary}), do: :continuation_summary
+  defp continuation_prompt_mode(_turn_number, _continuation_state), do: :reuse_thread
+
+  defp continuation_artifact_payload(issue, prompt_mode, turn_number, max_turns, continuation_state, context_summary_path) do
+    %{
+      kind: "continuation_artifact",
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      state: issue.state,
+      url: issue.url,
+      prompt_mode: Atom.to_string(prompt_mode),
+      turn_number: turn_number,
+      max_turns: max_turns,
+      context_summary_path: context_summary_path,
+      guardrails: continuation_guardrails_payload(continuation_state)
+    }
+  end
+
+  defp continuation_guardrails_payload(%{strategy: strategy, context: context}) do
+    %{
+      session_strategy: strategy,
+      prompt_mode: Map.get(context || %{}, :prompt_mode),
+      mode: Map.get(context || %{}, :mode),
+      risk_reason: format_risk_reason(Map.get(context || %{}, :risk_reason)),
+      counters: Map.get(context || %{}, :counters),
+      budget: Map.get(context || %{}, :budget),
+      usage: Map.get(context || %{}, :usage)
+    }
+  end
+
+  defp continuation_guardrails_payload(_continuation_state), do: %{session_strategy: :reuse_thread}
+
+  defp write_guardrail_artifact(path, artifact_payload) do
+    payload =
+      case File.read(path) do
+        {:ok, body} ->
+          case Jason.decode(body) do
+            {:ok, %{"kind" => "guardrail_hold"} = hold_payload} ->
+              Map.put(hold_payload, "continuation_artifact", artifact_payload)
+
+            _ ->
+              artifact_payload
+          end
+
+        _ ->
+          artifact_payload
+      end
+
+    File.write!(path, Jason.encode!(payload, pretty: true))
+  end
+
+  defp normalize_continuation_decision({:allow, mode, strategy, %Issue{} = issue, continuation_context})
+       when strategy in [:reuse_thread, :fresh_summary] and is_map(continuation_context),
+       do: {:allow, mode, strategy, issue, continuation_context}
+
+  defp normalize_continuation_decision({:allow, mode, strategy, %Issue{} = issue})
+       when strategy in [:reuse_thread, :fresh_summary],
+       do: {:allow, mode, strategy, issue, %{session_strategy: strategy}}
+
+  defp normalize_continuation_decision({:allow, mode, %Issue{} = issue}),
+    do: {:allow, mode, :reuse_thread, issue, %{session_strategy: :reuse_thread}}
+
+  defp normalize_continuation_decision(other), do: other
+
+  defp format_risk_reason(nil), do: nil
+  defp format_risk_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp format_risk_reason(reason), do: reason
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

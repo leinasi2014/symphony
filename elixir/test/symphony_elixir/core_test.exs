@@ -803,10 +803,13 @@ defmodule SymphonyElixir.CoreTest do
       }
     end)
 
-    assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-continuation-gate"}} =
+    assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-continuation-gate"}, continuation_context} =
              Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                {:ok, [%{issue | state: "In Progress"}]}
              end)
+
+    assert continuation_context.session_strategy == :fresh_summary
+    assert continuation_context.risk_reason == :max_total_turns_per_issue
 
     state = :sys.get_state(pid)
     ledger = Orchestrator.guardrail_ledger_for_test(state)[issue.id]
@@ -880,10 +883,12 @@ defmodule SymphonyElixir.CoreTest do
       }
     end)
 
-    assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-fresh-summary"}} =
+    assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-fresh-summary"}, continuation_context} =
              Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                {:ok, [%{issue | state: "In Progress"}]}
              end)
+
+    assert continuation_context.risk_reason == :soft_total_tokens
   end
 
   test "guardrail dispatch ledger increments continuation runs only for continuation retries" do
@@ -966,7 +971,7 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     for _ <- 1..2 do
-      assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-continuation-dedup"}} =
+      assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-continuation-dedup"}, _} =
                Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                  {:ok, [%{issue | state: "In Progress"}]}
                end)
@@ -1058,7 +1063,7 @@ defmodule SymphonyElixir.CoreTest do
          }}
       )
 
-      assert {:allow, :probe, :fresh_summary, _} =
+      assert {:allow, :probe, :fresh_summary, _, _} =
                Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                  {:ok, [%{issue | state: "In Progress"}]}
                end)
@@ -1069,7 +1074,7 @@ defmodule SymphonyElixir.CoreTest do
 
       File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\nthree\n")
 
-      assert {:allow, :default, :fresh_summary, _} =
+      assert {:allow, :default, :fresh_summary, _, _} =
                Orchestrator.request_continuation_for_test(pid, issue.id, 2, fn [_issue_id] ->
                  {:ok, [%{issue | state: "In Progress"}]}
                end)
@@ -1171,7 +1176,7 @@ defmodule SymphonyElixir.CoreTest do
 
       File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\nthree\n")
 
-      assert {:allow, :default, :reuse_thread, _} =
+      assert {:allow, :default, :reuse_thread, _, _} =
                Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                  {:ok, [%{issue | state: "In Progress"}]}
                end)
@@ -2001,7 +2006,7 @@ defmodule SymphonyElixir.CoreTest do
       %{initial_state | running: %{issue.id => running_entry}, claimed: MapSet.new([issue.id]), guardrail_ledger: ledger}
     end)
 
-    assert {:allow, :default, :fresh_summary, _} =
+    assert {:allow, :default, :fresh_summary, _, _} =
              Orchestrator.request_continuation_for_test(pid, issue.id, 2, fn [_issue_id] ->
                {:ok, [%{issue | state: "In Progress"}]}
              end)
@@ -2023,8 +2028,21 @@ defmodule SymphonyElixir.CoreTest do
       File.write!(
         Path.join(hold_dir, "guardrail_state.json"),
         Jason.encode!(%{
+          "kind" => "guardrail_hold",
           "issue_id" => "issue-reloaded-hold",
           "identifier" => "MT-819",
+          "mode" => "default",
+          "policy_mode" => "enforce",
+          "stop_state" => "Human Review",
+          "budget" => %{
+            "soft_total_tokens" => 120_000,
+            "hard_total_tokens" => 180_000,
+            "soft_input_tokens" => 100_000,
+            "hard_input_tokens" => 150_000,
+            "max_total_turns_per_issue" => 3,
+            "max_continuation_runs_per_issue" => 2,
+            "no_progress_turn_limit" => 1
+          },
           "stop_reason" => "hard_total_token_limit",
           "held_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
           "input_tokens" => 99,
@@ -2035,7 +2053,12 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         tracker_kind: "memory",
-        workspace_root: workspace_root
+        workspace_root: workspace_root,
+        agent_guardrails: %{
+          enabled: false,
+          mode: "observe",
+          stop_state: "Done"
+        }
       )
 
       orchestrator_name = Module.concat(__MODULE__, :ReloadedGuardrailHoldOrchestrator)
@@ -2053,6 +2076,16 @@ defmodule SymphonyElixir.CoreTest do
       assert hold.identifier == "MT-819"
       assert hold.stop_reason == "hard_total_token_limit"
       assert hold.total_tokens == 100
+      assert hold.policy_mode == "enforce"
+      assert hold.stop_state == "Human Review"
+
+      snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+      [snapshot_hold] = snapshot.guardrail_holds
+      assert snapshot_hold.stop_reason == "hard_total_token_limit"
+      assert snapshot_hold.guardrails.enabled == true
+      assert snapshot_hold.guardrails.policy_mode == "enforce"
+      assert snapshot_hold.guardrails.stop_state == "Human Review"
+      assert snapshot_hold.guardrails.budget.total_tokens == %{current: 100, soft_limit: 120_000, hard_limit: 180_000}
     after
       File.rm_rf(workspace_root)
     end
@@ -2572,7 +2605,8 @@ defmodule SymphonyElixir.CoreTest do
         max_turns: 3
       )
 
-    assert prompt =~ "Continuation summary:"
+    assert prompt =~ "You are an agent for this repository."
+    assert prompt =~ "Fresh-session continuation summary:"
     assert prompt =~ "Continuation turn #2 of 3"
     assert prompt =~ "shared/context_summary.md"
     assert prompt =~ "shared/guardrail_state.json"
@@ -2889,12 +2923,10 @@ defmodule SymphonyElixir.CoreTest do
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
-      assert Enum.at(turn_texts, 1) =~ "Continuation summary:"
-      assert Enum.at(turn_texts, 1) =~ "Continuation turn #2 of 3"
-      assert Enum.at(turn_texts, 1) =~ "shared/context_summary.md"
-      assert Enum.at(turn_texts, 1) =~ "shared/guardrail_state.json"
+      assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
+      assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
 
-      refute Enum.at(turn_texts, 1) =~
+      assert Enum.at(turn_texts, 1) =~
                "original task instructions and prior turn context are already present in this thread"
 
       workspace = Path.join(workspace_root, issue.identifier)
@@ -2903,16 +2935,17 @@ defmodule SymphonyElixir.CoreTest do
 
       assert File.exists?(context_summary)
       assert File.exists?(guardrail_state_path)
-      assert File.read!(context_summary) =~ "Prompt mode: continuation_summary"
+      assert File.read!(context_summary) =~ "Prompt mode: reuse_thread"
 
       guardrail_state = Jason.decode!(File.read!(guardrail_state_path))
       assert guardrail_state["kind"] == "continuation_artifact"
       assert guardrail_state["issue_id"] == "issue-continue"
       assert guardrail_state["identifier"] == "MT-247"
-      assert guardrail_state["prompt_mode"] == "continuation_summary"
+      assert guardrail_state["prompt_mode"] == "reuse_thread"
       assert guardrail_state["turn_number"] == 2
       assert guardrail_state["max_turns"] == 3
       assert guardrail_state["context_summary_path"] == "shared/context_summary.md"
+      assert get_in(guardrail_state, ["guardrails", "session_strategy"]) == "reuse_thread"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -2988,7 +3021,7 @@ defmodule SymphonyElixir.CoreTest do
         send(parent, {:continuation_request, issue_id, turn_number})
 
         if turn_number == 1 do
-          {:allow, :probe, issue}
+          {:allow, :probe, :reuse_thread, issue, %{session_strategy: :reuse_thread}}
         else
           {:deny, :issue_not_active}
         end
@@ -3118,8 +3151,14 @@ defmodule SymphonyElixir.CoreTest do
         end)
 
       assert length(turn_texts) == 2
-      assert Enum.at(turn_texts, 1) =~ "Continuation summary:"
+      assert Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
+      assert Enum.at(turn_texts, 1) =~ "Fresh-session continuation summary:"
       assert Enum.at(turn_texts, 1) =~ "shared/context_summary.md"
+
+      workspace = Path.join(workspace_root, issue.identifier)
+      guardrail_state_path = Path.join([workspace, "shared", "guardrail_state.json"])
+      guardrail_state = Jason.decode!(File.read!(guardrail_state_path))
+      assert get_in(guardrail_state, ["guardrails", "session_strategy"]) == "fresh_summary"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
