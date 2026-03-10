@@ -110,7 +110,8 @@ defmodule SymphonyElixir.AgentRunner do
          turn_number,
          max_turns
        ) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    :ok = write_continuation_artifacts(workspace, issue, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns, workspace)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -153,18 +154,20 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns, _workspace) do
+    PromptBuilder.build_prompt(issue, Keyword.put(opts, :prompt_mode, :initial))
+  end
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
-    """
-    Continuation guidance:
-
-    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
-    - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-    - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
-    """
+  defp build_turn_prompt(issue, opts, turn_number, max_turns, _workspace) do
+    PromptBuilder.build_prompt(
+      issue,
+      opts
+      |> Keyword.put(:prompt_mode, :continuation_summary)
+      |> Keyword.put(:turn_number, turn_number)
+      |> Keyword.put(:max_turns, max_turns)
+      |> Keyword.put_new(:context_summary_path, Path.join("shared", "context_summary.md"))
+      |> Keyword.put_new(:guardrail_state_path, Path.join("shared", "guardrail_state.json"))
+    )
   end
 
   defp default_continuation_decider(recipient, issue_state_fetcher) when is_pid(recipient) do
@@ -202,6 +205,70 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp fallback_continuation_decision(_issue, _issue_state_fetcher), do: {:deny, :issue_not_active}
+
+  defp write_continuation_artifacts(workspace, issue, turn_number, max_turns)
+       when is_binary(workspace) and is_integer(turn_number) and turn_number > 0 do
+    shared_dir = Path.join(workspace, "shared")
+    File.mkdir_p!(shared_dir)
+
+    prompt_mode =
+      if turn_number == 1 do
+        :initial
+      else
+        :continuation_summary
+      end
+
+    context_summary_path = Path.join(shared_dir, "context_summary.md")
+    guardrail_state_path = Path.join(shared_dir, "guardrail_state.json")
+
+    File.write!(context_summary_path, build_context_summary(issue, prompt_mode, turn_number, max_turns))
+
+    File.write!(
+      guardrail_state_path,
+      Jason.encode!(
+        %{
+          kind: "continuation_artifact",
+          generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          issue_id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          state: issue.state,
+          url: issue.url,
+          prompt_mode: Atom.to_string(prompt_mode),
+          turn_number: turn_number,
+          max_turns: max_turns,
+          context_summary_path: Path.join("shared", "context_summary.md")
+        },
+        pretty: true
+      )
+    )
+
+    :ok
+  end
+
+  defp build_context_summary(issue, prompt_mode, turn_number, max_turns) do
+    """
+    # Context Summary
+
+    - Issue: #{issue.identifier || "unknown"}
+    - Title: #{issue.title || "Untitled"}
+    - Current Linear state: #{issue.state || "unknown"}
+    - Prompt mode: #{prompt_mode}
+    - Turn: #{turn_number} of #{max_turns}
+    - Guardrail state file: `shared/guardrail_state.json`
+
+    ## Issue Description
+
+    #{issue.description || "No description provided."}
+
+    ## Resume Guidance
+
+    - Resume from the current workspace state instead of assuming old thread history is available.
+    - Read `shared/guardrail_state.json` before acting.
+    - Focus only on the remaining ticket work for this issue.
+    """
+    |> String.trim()
+  end
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

@@ -1042,7 +1042,11 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, body} ->
             case Jason.decode(body) do
               {:ok, %{"issue_id" => issue_id} = hold} when is_binary(issue_id) ->
-                Map.put(holds, issue_id, decoded_guardrail_hold(hold))
+                if persisted_guardrail_hold_payload?(hold) do
+                  Map.put(holds, issue_id, decoded_guardrail_hold(hold))
+                else
+                  holds
+                end
 
               _ ->
                 holds
@@ -1078,6 +1082,7 @@ defmodule SymphonyElixir.Orchestrator do
     File.mkdir_p!(shared_dir)
 
     payload = %{
+      kind: "guardrail_hold",
       issue_id: hold.issue_id,
       identifier: identifier,
       mode: hold.mode,
@@ -1100,6 +1105,15 @@ defmodule SymphonyElixir.Orchestrator do
     File.rm(path)
     :ok
   end
+
+  defp persisted_guardrail_hold_payload?(%{"kind" => "continuation_artifact"}), do: false
+  defp persisted_guardrail_hold_payload?(%{"kind" => "guardrail_hold"}), do: true
+
+  defp persisted_guardrail_hold_payload?(%{"held_at" => held_at, "stop_reason" => stop_reason})
+       when is_binary(held_at) and is_binary(stop_reason),
+       do: true
+
+  defp persisted_guardrail_hold_payload?(_payload), do: false
 
   defp apply_guardrail_stop(%State{} = state, issue_id, reason, trigger) do
     if guardrail_hold_active?(state, issue_id) do

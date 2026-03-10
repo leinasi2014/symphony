@@ -1994,6 +1994,48 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "startup ignores continuation artifacts in shared guardrail state" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "guardrail-artifact-reload-#{System.unique_integer([:positive])}")
+
+    try do
+      hold_dir = Path.join([workspace_root, "MT-820", "shared"])
+      File.mkdir_p!(hold_dir)
+
+      File.write!(
+        Path.join(hold_dir, "guardrail_state.json"),
+        Jason.encode!(%{
+          "kind" => "continuation_artifact",
+          "issue_id" => "issue-continuation-artifact",
+          "identifier" => "MT-820",
+          "prompt_mode" => "continuation_summary",
+          "turn_number" => 2,
+          "max_turns" => 3,
+          "context_summary_path" => "shared/context_summary.md"
+        })
+      )
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :ContinuationArtifactReloadOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      state = :sys.get_state(pid)
+      assert Orchestrator.guardrail_holds_for_test(state) == %{}
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "state writeback failure still leaves the issue held" do
     workspace_root = Path.join(System.tmp_dir!(), "guardrail-writeback-#{System.unique_integer([:positive])}")
 
@@ -2449,6 +2491,45 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt == "Retry #2"
   end
 
+  test "prompt builder supports continuation summary mode" do
+    issue = %Issue{
+      identifier: "MT-301",
+      title: "Resume with artifacts",
+      description: "Use workspace artifacts instead of old thread history",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-301",
+      labels: []
+    }
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        prompt_mode: :continuation_summary,
+        turn_number: 2,
+        max_turns: 3
+      )
+
+    assert prompt =~ "Continuation summary:"
+    assert prompt =~ "Continuation turn #2 of 3"
+    assert prompt =~ "shared/context_summary.md"
+    assert prompt =~ "shared/guardrail_state.json"
+    assert prompt =~ "Do not assume the full prior thread history is available"
+  end
+
+  test "prompt builder rejects unsupported prompt modes" do
+    issue = %Issue{
+      identifier: "MT-302",
+      title: "Unsupported mode",
+      description: "Prompt mode validation",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-302",
+      labels: []
+    }
+
+    assert_raise ArgumentError, ~r/unsupported_prompt_mode/, fn ->
+      PromptBuilder.build_prompt(issue, prompt_mode: :mystery)
+    end
+  end
+
   test "agent runner keeps workspace after successful codex run" do
     test_root =
       Path.join(
@@ -2744,8 +2825,30 @@ defmodule SymphonyElixir.CoreTest do
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
-      assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
-      assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "Continuation summary:"
+      assert Enum.at(turn_texts, 1) =~ "Continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "shared/context_summary.md"
+      assert Enum.at(turn_texts, 1) =~ "shared/guardrail_state.json"
+
+      refute Enum.at(turn_texts, 1) =~
+               "original task instructions and prior turn context are already present in this thread"
+
+      workspace = Path.join(workspace_root, issue.identifier)
+      context_summary = Path.join([workspace, "shared", "context_summary.md"])
+      guardrail_state_path = Path.join([workspace, "shared", "guardrail_state.json"])
+
+      assert File.exists?(context_summary)
+      assert File.exists?(guardrail_state_path)
+      assert File.read!(context_summary) =~ "Prompt mode: continuation_summary"
+
+      guardrail_state = Jason.decode!(File.read!(guardrail_state_path))
+      assert guardrail_state["kind"] == "continuation_artifact"
+      assert guardrail_state["issue_id"] == "issue-continue"
+      assert guardrail_state["identifier"] == "MT-247"
+      assert guardrail_state["prompt_mode"] == "continuation_summary"
+      assert guardrail_state["turn_number"] == 2
+      assert guardrail_state["max_turns"] == 3
+      assert guardrail_state["context_summary_path"] == "shared/context_summary.md"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
