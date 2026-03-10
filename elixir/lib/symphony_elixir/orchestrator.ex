@@ -32,6 +32,7 @@ defmodule SymphonyElixir.Orchestrator do
       :next_poll_due_at_ms,
       :poll_check_in_progress,
       running: %{},
+      guardrail_ledger: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
@@ -46,6 +47,26 @@ defmodule SymphonyElixir.Orchestrator do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  @spec request_continuation(GenServer.server(), String.t(), pos_integer()) ::
+          {:allow, :probe | :default, Issue.t()} | {:deny, term()}
+  def request_continuation(server, issue_id, turn_number)
+      when is_binary(issue_id) and is_integer(turn_number) and turn_number > 0 do
+    request_continuation(server, issue_id, turn_number, &Tracker.fetch_issue_states_by_ids/1)
+  end
+
+  @doc false
+  @spec request_continuation_for_test(
+          GenServer.server(),
+          String.t(),
+          pos_integer(),
+          ([String.t()] -> term())
+        ) :: {:allow, :probe | :default, Issue.t()} | {:deny, term()}
+  def request_continuation_for_test(server, issue_id, turn_number, issue_fetcher)
+      when is_binary(issue_id) and is_integer(turn_number) and turn_number > 0 and
+             is_function(issue_fetcher, 1) do
+    request_continuation(server, issue_id, turn_number, issue_fetcher)
+  end
+
   @impl true
   def init(_opts) do
     now_ms = System.monotonic_time(:millisecond)
@@ -55,6 +76,7 @@ defmodule SymphonyElixir.Orchestrator do
       max_concurrent_agents: Config.max_concurrent_agents(),
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
+      guardrail_ledger: %{},
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
@@ -104,14 +126,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation
-              })
+              handle_normal_worker_exit(state, issue_id, running_entry, session_id)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -120,7 +135,8 @@ defmodule SymphonyElixir.Orchestrator do
 
               schedule_issue_retry(state, issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}"
+                error: "agent exited: #{inspect(reason)}",
+                retry_kind: :failure
               })
           end
 
@@ -146,6 +162,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> sync_guardrail_ledger_from_running_entry(issue_id, updated_running_entry)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -287,6 +304,17 @@ defmodule SymphonyElixir.Orchestrator do
     sort_issues_for_dispatch(issues)
   end
 
+  @doc false
+  @spec guardrail_ledger_for_test(map()) :: map()
+  def guardrail_ledger_for_test(%State{} = state), do: state.guardrail_ledger
+  def guardrail_ledger_for_test(state) when is_map(state), do: Map.get(state, :guardrail_ledger, %{})
+
+  @doc false
+  @spec put_guardrail_dispatch_for_test(map(), Issue.t(), DateTime.t(), atom()) :: map()
+  def put_guardrail_dispatch_for_test(%State{} = state, %Issue{} = issue, %DateTime{} = started_at, retry_kind) do
+    put_guardrail_ledger_on_dispatch(state, issue, started_at, retry_kind)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -403,7 +431,8 @@ defmodule SymphonyElixir.Orchestrator do
       |> terminate_running_issue(issue_id, false)
       |> schedule_issue_retry(issue_id, next_attempt, %{
         identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity"
+        error: "stalled for #{elapsed_ms}ms without codex activity",
+        retry_kind: :failure
       })
     else
       state
@@ -599,10 +628,10 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil) do
+  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, retry_kind \\ :initial) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt)
+        do_dispatch_issue(state, refreshed_issue, attempt, retry_kind)
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -619,14 +648,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, retry_kind) do
     recipient = self()
 
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt)
+           AgentRunner.run(issue, recipient, attempt: attempt, continuation_orchestrator: recipient)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
+        started_at = DateTime.utc_now()
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)}")
 
@@ -649,15 +679,19 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: started_at
           })
 
-        %{
-          state
-          | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
-        }
+        state
+        |> put_guardrail_ledger_on_dispatch(issue, started_at, retry_kind)
+        |> then(fn updated_state ->
+          %{
+            updated_state
+            | running: running,
+              claimed: MapSet.put(updated_state.claimed, issue.id),
+              retry_attempts: Map.delete(updated_state.retry_attempts, issue.id)
+          }
+        end)
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
@@ -665,7 +699,8 @@ defmodule SymphonyElixir.Orchestrator do
 
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
-          error: "failed to spawn agent: #{inspect(reason)}"
+          error: "failed to spawn agent: #{inspect(reason)}",
+          retry_kind: retry_kind
         })
     end
   end
@@ -726,7 +761,9 @@ defmodule SymphonyElixir.Orchestrator do
             timer_ref: timer_ref,
             due_at_ms: due_at_ms,
             identifier: identifier,
-            error: error
+            error: error,
+            retry_kind: pick_retry_kind(previous_retry, metadata),
+            delay_type: Map.get(metadata, :delay_type)
           })
     }
   end
@@ -736,7 +773,9 @@ defmodule SymphonyElixir.Orchestrator do
       %{attempt: attempt} = retry_entry ->
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
-          error: Map.get(retry_entry, :error)
+          error: Map.get(retry_entry, :error),
+          retry_kind: Map.get(retry_entry, :retry_kind),
+          delay_type: Map.get(retry_entry, :delay_type)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -821,7 +860,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) do
-      {:noreply, dispatch_issue(state, issue, attempt)}
+      {:noreply, dispatch_issue(state, issue, attempt, Map.get(metadata, :retry_kind, :failure))}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
@@ -835,6 +874,44 @@ defmodule SymphonyElixir.Orchestrator do
            error: "no available orchestrator slots"
          })
        )}
+    end
+  end
+
+  defp handle_normal_worker_exit(state, issue_id, running_entry, session_id) do
+    case get_in(state.guardrail_ledger, [issue_id, :last_continuation_decision]) do
+      {:deny, :issue_not_active} ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied because issue is no longer active")
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      {:deny, :issue_missing} ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied because issue is missing")
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      {:deny, reason} ->
+        Logger.warning("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied with retryable reason=#{inspect(reason)}")
+
+        schedule_issue_retry(state, issue_id, nil, %{
+          identifier: running_entry.identifier,
+          error: "continuation denied: #{inspect(reason)}",
+          retry_kind: :failure
+        })
+
+      _ ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          delay_type: :continuation,
+          retry_kind: :continuation
+        })
     end
   end
 
@@ -873,6 +950,10 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:error] || Map.get(previous_retry, :error)
   end
 
+  defp pick_retry_kind(previous_retry, metadata) do
+    metadata[:retry_kind] || Map.get(previous_retry, :retry_kind) || :failure
+  end
+
   defp find_issue_by_id(issues, issue_id) when is_binary(issue_id) do
     Enum.find(issues, fn
       %Issue{id: ^issue_id} ->
@@ -905,6 +986,23 @@ defmodule SymphonyElixir.Orchestrator do
       0
     )
   end
+
+  defp request_continuation(server, issue_id, turn_number, issue_fetcher)
+       when is_function(issue_fetcher, 1) do
+    if server_available?(server) do
+      try do
+        GenServer.call(server, {:request_continuation, issue_id, turn_number, issue_fetcher}, 5_000)
+      catch
+        :exit, _ -> {:deny, :orchestrator_unavailable}
+      end
+    else
+      {:deny, :orchestrator_unavailable}
+    end
+  end
+
+  defp server_available?(server) when is_pid(server), do: Process.alive?(server)
+  defp server_available?(server) when is_atom(server), do: is_pid(Process.whereis(server))
+  defp server_available?(_server), do: false
 
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do
@@ -1007,6 +1105,160 @@ defmodule SymphonyElixir.Orchestrator do
        operations: ["poll", "reconcile"]
      }, state}
   end
+
+  def handle_call({:request_continuation, issue_id, turn_number, issue_fetcher}, _from, state)
+      when is_binary(issue_id) and is_integer(turn_number) and turn_number > 0 and
+             is_function(issue_fetcher, 1) do
+    {reply, state} = evaluate_continuation_request(state, issue_id, turn_number, issue_fetcher)
+    {:reply, reply, state}
+  end
+
+  defp evaluate_continuation_request(%State{} = state, issue_id, turn_number, issue_fetcher) do
+    case Map.get(state.running, issue_id) do
+      %{issue: %Issue{}} = running_entry ->
+        state =
+          state
+          |> sync_guardrail_ledger_from_running_entry(issue_id, running_entry)
+          |> mark_completed_turn(issue_id, turn_number)
+
+        case issue_fetcher.([issue_id]) do
+          {:ok, [%Issue{} = refreshed_issue | _]} ->
+            if active_issue_state?(refreshed_issue.state, active_state_set()) do
+              mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
+
+              state =
+                state
+                |> update_running_issue_if_present(refreshed_issue)
+                |> update_guardrail_ledger(issue_id, fn entry ->
+                  entry
+                  |> Map.put(:stop_reason, nil)
+                  |> Map.put(:last_continuation_decision, {:allow, mode})
+                  |> Map.put(:last_turn_started_at, DateTime.utc_now())
+                end)
+
+              {{:allow, mode, refreshed_issue}, state}
+            else
+              deny_continuation(state, issue_id, :issue_not_active)
+            end
+
+          {:ok, []} ->
+            deny_continuation(state, issue_id, :issue_missing)
+
+          {:error, reason} ->
+            deny_continuation(state, issue_id, {:issue_state_refresh_failed, reason})
+        end
+
+      _ ->
+        {{:deny, :issue_not_running}, state}
+    end
+  end
+
+  defp update_running_issue_if_present(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.running, issue.id) do
+      %{issue: _} = running_entry ->
+        %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
+
+      _ ->
+        state
+    end
+  end
+
+  defp mark_completed_turn(%State{} = state, issue_id, turn_number) do
+    update_guardrail_ledger(state, issue_id, fn entry ->
+      if turn_number > Map.get(entry, :last_completed_turn_number, 0) do
+        entry
+        |> Map.update!(:total_turns, &(&1 + 1))
+        |> Map.put(:last_turn_completed_at, DateTime.utc_now())
+        |> Map.put(:last_completed_turn_number, turn_number)
+      else
+        entry
+      end
+    end)
+  end
+
+  defp deny_continuation(%State{} = state, issue_id, reason) do
+    state =
+      update_guardrail_ledger(state, issue_id, fn entry ->
+        entry
+        |> Map.put(:stop_reason, reason)
+        |> Map.put(:last_continuation_decision, {:deny, reason})
+      end)
+
+    {{:deny, reason}, state}
+  end
+
+  defp sync_guardrail_ledger_from_running_entry(%State{} = state, issue_id, running_entry)
+       when is_map(running_entry) do
+    update_guardrail_ledger(state, issue_id, fn entry ->
+      entry
+      |> Map.put(:issue_identifier, running_entry.identifier)
+      |> Map.put(:total_input_tokens, Map.get(running_entry, :codex_input_tokens, 0))
+      |> Map.put(:total_output_tokens, Map.get(running_entry, :codex_output_tokens, 0))
+      |> Map.put(:total_tokens, Map.get(running_entry, :codex_total_tokens, 0))
+    end)
+  end
+
+  defp sync_guardrail_ledger_from_running_entry(state, _issue_id, _running_entry), do: state
+
+  defp update_guardrail_ledger(%State{} = state, issue_id, updater) when is_function(updater, 1) do
+    entry =
+      state.guardrail_ledger
+      |> Map.get(issue_id, new_guardrail_ledger_entry())
+      |> updater.()
+
+    %{state | guardrail_ledger: Map.put(state.guardrail_ledger, issue_id, entry)}
+  end
+
+  defp new_guardrail_ledger_entry do
+    %{
+      issue_identifier: nil,
+      mode: initial_guardrail_mode(),
+      stop_reason: nil,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      total_tokens: 0,
+      total_turns: 0,
+      continuation_runs: 0,
+      no_progress_turns: 0,
+      first_started_at: nil,
+      last_turn_started_at: nil,
+      last_turn_completed_at: nil,
+      last_progress_fingerprint: nil,
+      last_warning_at: nil,
+      last_completed_turn_number: 0,
+      last_continuation_decision: nil
+    }
+  end
+
+  defp initial_guardrail_mode do
+    if Config.guardrails_enabled?(), do: :probe, else: :default
+  end
+
+  defp ledger_mode_for_issue(guardrail_ledger, issue_id) when is_map(guardrail_ledger) do
+    case Map.get(guardrail_ledger, issue_id) do
+      %{mode: mode} when mode in [:probe, :default] -> mode
+      _ -> initial_guardrail_mode()
+    end
+  end
+
+  defp put_guardrail_ledger_on_dispatch(%State{} = state, %Issue{} = issue, started_at, retry_kind) do
+    update_guardrail_ledger(state, issue.id, fn entry ->
+      entry
+      |> Map.put(:issue_identifier, issue.identifier)
+      |> Map.put(:mode, Map.get(entry, :mode, initial_guardrail_mode()))
+      |> Map.put(:stop_reason, nil)
+      |> Map.put(:last_continuation_decision, nil)
+      |> Map.put(:first_started_at, entry.first_started_at || started_at)
+      |> Map.put(:last_turn_started_at, started_at)
+      |> maybe_increment_continuation_runs(retry_kind)
+    end)
+  end
+
+  defp maybe_increment_continuation_runs(entry, :continuation) do
+    Map.update!(entry, :continuation_runs, &(&1 + 1))
+  end
+
+  defp maybe_increment_continuation_runs(entry, _retry_kind), do: entry
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)

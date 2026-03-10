@@ -752,6 +752,288 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(agent_pid)
   end
 
+  test "orchestrator request_continuation updates guardrail ledger and allows active issues" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "observe",
+        stop_state: "Human Review"
+      }
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationGateOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    issue = %Issue{
+      id: "issue-continuation-gate",
+      identifier: "MT-807",
+      title: "Continuation gate",
+      description: "Ledger should update at turn boundaries",
+      state: "In Progress",
+      labels: ["exec-ready"]
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-ledger",
+      codex_input_tokens: 12,
+      codex_output_tokens: 4,
+      codex_total_tokens: 16,
+      started_at: DateTime.utc_now()
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{issue.id => running_entry},
+          claimed: MapSet.new([issue.id])
+      }
+    end)
+
+    assert {:allow, :probe, %Issue{id: "issue-continuation-gate"}} =
+             Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
+               {:ok, [%{issue | state: "In Progress"}]}
+             end)
+
+    state = :sys.get_state(pid)
+    ledger = Orchestrator.guardrail_ledger_for_test(state)[issue.id]
+
+    assert ledger.issue_identifier == issue.identifier
+    assert ledger.mode == :probe
+    assert ledger.total_input_tokens == 12
+    assert ledger.total_output_tokens == 4
+    assert ledger.total_tokens == 16
+    assert ledger.total_turns == 1
+    assert ledger.continuation_runs == 0
+    assert ledger.no_progress_turns == 0
+    assert %DateTime{} = ledger.last_turn_completed_at
+  end
+
+  test "guardrail dispatch ledger increments continuation runs only for continuation retries" do
+    started_at = DateTime.utc_now()
+
+    issue = %Issue{
+      id: "issue-ledger-dispatch",
+      identifier: "MT-808",
+      state: "Todo",
+      title: "Ledger dispatch",
+      description: "Track continuation runs"
+    }
+
+    state = %Orchestrator.State{}
+
+    state =
+      Orchestrator.put_guardrail_dispatch_for_test(state, issue, started_at, :initial)
+
+    state =
+      Orchestrator.put_guardrail_dispatch_for_test(state, issue, started_at, :failure)
+
+    state =
+      Orchestrator.put_guardrail_dispatch_for_test(state, issue, started_at, :continuation)
+
+    ledger = Orchestrator.guardrail_ledger_for_test(state)[issue.id]
+
+    assert ledger.continuation_runs == 1
+    assert ledger.first_started_at == started_at
+    assert ledger.last_turn_started_at == started_at
+  end
+
+  test "orchestrator request_continuation does not double-count the same turn number" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "observe",
+        stop_state: "Human Review"
+      }
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationDedupOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    issue = %Issue{
+      id: "issue-continuation-dedup",
+      identifier: "MT-809",
+      title: "Continuation dedup",
+      description: "Same turn should not count twice",
+      state: "In Progress"
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-dedup",
+      codex_input_tokens: 5,
+      codex_output_tokens: 2,
+      codex_total_tokens: 7,
+      started_at: DateTime.utc_now()
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{issue.id => running_entry},
+          claimed: MapSet.new([issue.id])
+      }
+    end)
+
+    for _ <- 1..2 do
+      assert {:allow, :probe, %Issue{id: "issue-continuation-dedup"}} =
+               Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
+                 {:ok, [%{issue | state: "In Progress"}]}
+               end)
+    end
+
+    ledger = Orchestrator.guardrail_ledger_for_test(:sys.get_state(pid))[issue.id]
+    assert ledger.total_turns == 1
+  end
+
+  test "normal worker exit does not schedule continuation retry after gate denial" do
+    issue_id = "issue-denied-continuation"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :DeniedContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-810",
+      issue: %Issue{id: issue_id, identifier: "MT-810", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    guardrail_ledger = %{
+      issue_id => %{
+        issue_identifier: "MT-810",
+        mode: :probe,
+        stop_reason: :issue_not_active,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_tokens: 0,
+        total_turns: 1,
+        continuation_runs: 0,
+        no_progress_turns: 0,
+        first_started_at: DateTime.utc_now(),
+        last_turn_started_at: DateTime.utc_now(),
+        last_turn_completed_at: DateTime.utc_now(),
+        last_progress_fingerprint: nil,
+        last_warning_at: nil,
+        last_completed_turn_number: 1,
+        last_continuation_decision: {:deny, :issue_not_active}
+      }
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{issue_id => running_entry},
+          claimed: MapSet.new([issue_id]),
+          retry_attempts: %{},
+          guardrail_ledger: guardrail_ledger
+      }
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+  end
+
+  test "retryable gate denial schedules a failure retry instead of continuation retry" do
+    issue_id = "issue-denied-refresh"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :DeniedRefreshRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-811",
+      issue: %Issue{id: issue_id, identifier: "MT-811", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    guardrail_ledger = %{
+      issue_id => %{
+        issue_identifier: "MT-811",
+        mode: :probe,
+        stop_reason: {:issue_state_refresh_failed, :boom},
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_tokens: 0,
+        total_turns: 1,
+        continuation_runs: 0,
+        no_progress_turns: 0,
+        first_started_at: DateTime.utc_now(),
+        last_turn_started_at: DateTime.utc_now(),
+        last_turn_completed_at: DateTime.utc_now(),
+        last_progress_fingerprint: nil,
+        last_warning_at: nil,
+        last_completed_turn_number: 1,
+        last_continuation_decision: {:deny, {:issue_state_refresh_failed, :boom}}
+      }
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{issue_id => running_entry},
+          claimed: MapSet.new([issue_id]),
+          retry_attempts: %{},
+          guardrail_ledger: guardrail_ledger
+      }
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{attempt: 1, error: error, retry_kind: :failure} = state.retry_attempts[issue_id]
+    assert error =~ "continuation denied"
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
@@ -1407,6 +1689,103 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner asks the continuation decider between completed turns" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-gate-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-gate"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-gate-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-gate-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      parent = self()
+
+      continuation_decider = fn %Issue{id: issue_id} = issue, turn_number ->
+        send(parent, {:continuation_request, issue_id, turn_number})
+
+        if turn_number == 1 do
+          {:allow, :probe, issue}
+        else
+          {:deny, :issue_not_active}
+        end
+      end
+
+      issue = %Issue{
+        id: "issue-gated-continue",
+        identifier: "MT-249",
+        title: "Continue with gate",
+        description: "Continuation requires orchestrator approval",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, continuation_decider: continuation_decider)
+      assert_receive {:continuation_request, "issue-gated-continue", 1}
+      assert_receive {:continuation_request, "issue-gated-continue", 2}
+
+      trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, Orchestrator, PromptBuilder, Tracker, Workspace}
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -50,16 +50,41 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.agent_max_turns())
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
+    continuation_decider =
+      Keyword.get(
+        opts,
+        :continuation_decider,
+        default_continuation_decider(codex_update_recipient, issue_state_fetcher)
+      )
+
     with {:ok, session} <- AppServer.start_session(workspace) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          continuation_decider,
+          1,
+          max_turns
+        )
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         continuation_decider,
+         turn_number,
+         max_turns
+       ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
@@ -71,9 +96,9 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+      case continuation_decider.(issue, turn_number) do
+        {:allow, _mode, %Issue{} = refreshed_issue} when turn_number < max_turns ->
+          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after orchestrator approval turn=#{turn_number}/#{max_turns}")
 
           do_run_codex_turns(
             app_session,
@@ -81,17 +106,20 @@ defmodule SymphonyElixir.AgentRunner do
             refreshed_issue,
             codex_update_recipient,
             opts,
-            issue_state_fetcher,
+            continuation_decider,
             turn_number + 1,
             max_turns
           )
 
-        {:continue, refreshed_issue} ->
+        {:allow, _mode, %Issue{} = refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
           :ok
 
-        {:done, _refreshed_issue} ->
+        {:deny, _reason} ->
+          :ok
+
+        :unavailable ->
           :ok
 
         {:error, reason} ->
@@ -114,24 +142,41 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp default_continuation_decider(recipient, issue_state_fetcher) when is_pid(recipient) do
+    fn
+      %Issue{id: issue_id}, turn_number when is_binary(issue_id) ->
+        Orchestrator.request_continuation(recipient, issue_id, turn_number)
+
+      issue, _turn_number ->
+        fallback_continuation_decision(issue, issue_state_fetcher)
+    end
+  end
+
+  defp default_continuation_decider(_recipient, issue_state_fetcher) do
+    fn issue, _turn_number ->
+      fallback_continuation_decision(issue, issue_state_fetcher)
+    end
+  end
+
+  defp fallback_continuation_decision(%Issue{id: issue_id}, issue_state_fetcher)
+       when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state) do
-          {:continue, refreshed_issue}
+          {:allow, :default, refreshed_issue}
         else
-          {:done, refreshed_issue}
+          {:deny, :issue_not_active}
         end
 
       {:ok, []} ->
-        {:done, issue}
+        {:deny, :issue_missing}
 
       {:error, reason} ->
         {:error, {:issue_state_refresh_failed, reason}}
     end
   end
 
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+  defp fallback_continuation_decision(_issue, _issue_state_fetcher), do: {:deny, :issue_not_active}
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
