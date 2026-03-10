@@ -803,7 +803,7 @@ defmodule SymphonyElixir.CoreTest do
       }
     end)
 
-    assert {:allow, :probe, %Issue{id: "issue-continuation-gate"}} =
+    assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-continuation-gate"}} =
              Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                {:ok, [%{issue | state: "In Progress"}]}
              end)
@@ -820,6 +820,70 @@ defmodule SymphonyElixir.CoreTest do
     assert ledger.continuation_runs == 0
     assert ledger.no_progress_turns == 0
     assert %DateTime{} = ledger.last_turn_completed_at
+  end
+
+  test "orchestrator request_continuation switches to fresh summary after soft budget hits" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      codex_command: "/bin/sh app-server",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "observe",
+        stop_state: "Human Review",
+        probe: %{
+          max_total_turns_per_issue: 2,
+          soft_total_tokens: 10,
+          hard_total_tokens: 50,
+          soft_input_tokens: 20,
+          hard_input_tokens: 40
+        }
+      }
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationFreshSummaryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    issue = %Issue{
+      id: "issue-fresh-summary",
+      identifier: "MT-807-FRESH",
+      title: "Fresh summary continuation",
+      description: "Soft budget should switch continuation strategy",
+      state: "In Progress",
+      labels: ["exec-ready"]
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-fresh-summary",
+      codex_input_tokens: 8,
+      codex_output_tokens: 4,
+      codex_total_tokens: 12,
+      started_at: DateTime.utc_now()
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{issue.id => running_entry},
+          claimed: MapSet.new([issue.id])
+      }
+    end)
+
+    assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-fresh-summary"}} =
+             Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
+               {:ok, [%{issue | state: "In Progress"}]}
+             end)
   end
 
   test "guardrail dispatch ledger increments continuation runs only for continuation retries" do
@@ -902,7 +966,7 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     for _ <- 1..2 do
-      assert {:allow, :probe, %Issue{id: "issue-continuation-dedup"}} =
+      assert {:allow, :probe, :fresh_summary, %Issue{id: "issue-continuation-dedup"}} =
                Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                  {:ok, [%{issue | state: "In Progress"}]}
                end)
@@ -994,7 +1058,7 @@ defmodule SymphonyElixir.CoreTest do
          }}
       )
 
-      assert {:allow, :probe, _} =
+      assert {:allow, :probe, :fresh_summary, _} =
                Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                  {:ok, [%{issue | state: "In Progress"}]}
                end)
@@ -1005,7 +1069,7 @@ defmodule SymphonyElixir.CoreTest do
 
       File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\nthree\n")
 
-      assert {:allow, :default, _} =
+      assert {:allow, :default, :fresh_summary, _} =
                Orchestrator.request_continuation_for_test(pid, issue.id, 2, fn [_issue_id] ->
                  {:ok, [%{issue | state: "In Progress"}]}
                end)
@@ -1107,7 +1171,7 @@ defmodule SymphonyElixir.CoreTest do
 
       File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\nthree\n")
 
-      assert {:allow, :default, _} =
+      assert {:allow, :default, :reuse_thread, _} =
                Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
                  {:ok, [%{issue | state: "In Progress"}]}
                end)
@@ -1937,7 +2001,7 @@ defmodule SymphonyElixir.CoreTest do
       %{initial_state | running: %{issue.id => running_entry}, claimed: MapSet.new([issue.id]), guardrail_ledger: ledger}
     end)
 
-    assert {:allow, :default, _} =
+    assert {:allow, :default, :fresh_summary, _} =
              Orchestrator.request_continuation_for_test(pid, issue.id, 2, fn [_issue_id] ->
                {:ok, [%{issue | state: "In Progress"}]}
              end)
@@ -2946,6 +3010,116 @@ defmodule SymphonyElixir.CoreTest do
 
       trace = File.read!(trace_file)
       assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner uses a fresh summary session for high-risk continuation" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-fresh-summary-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      session_marker="$(date +%s%N)-$$"
+      printf 'RUN:%s\\n' "$session_marker" >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-fresh"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-fresh-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      parent = self()
+
+      continuation_decider = fn %Issue{id: issue_id} = issue, turn_number ->
+        send(parent, {:continuation_request, issue_id, turn_number})
+
+        if turn_number == 1 do
+          {:allow, :default, :fresh_summary, issue}
+        else
+          {:deny, :issue_not_active}
+        end
+      end
+
+      issue = %Issue{
+        id: "issue-fresh-summary-runner",
+        identifier: "MT-250",
+        title: "Fresh summary continuation",
+        description: "High-risk continuation should start a new session",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-250",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, continuation_decider: continuation_decider)
+      assert_receive {:continuation_request, "issue-fresh-summary-runner", 1}
+      assert_receive {:continuation_request, "issue-fresh-summary-runner", 2}
+
+      trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/"method":"thread\/start"/, trace)) == 2
+
+      turn_texts =
+        trace
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(fn payload ->
+          get_in(payload, ["params", "input"])
+          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+        end)
+
+      assert length(turn_texts) == 2
+      assert Enum.at(turn_texts, 1) =~ "Continuation summary:"
+      assert Enum.at(turn_texts, 1) =~ "shared/context_summary.md"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

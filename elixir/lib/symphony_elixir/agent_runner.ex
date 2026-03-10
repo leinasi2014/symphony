@@ -123,6 +123,42 @@ defmodule SymphonyElixir.AgentRunner do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
       case continuation_decider.(issue, turn_number) do
+        {:allow, _mode, :reuse_thread, %Issue{} = refreshed_issue} when turn_number < max_turns ->
+          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after orchestrator approval turn=#{turn_number}/#{max_turns}")
+
+          do_run_codex_turns(
+            app_session,
+            workspace,
+            refreshed_issue,
+            codex_update_recipient,
+            opts,
+            continuation_decider,
+            turn_number + 1,
+            max_turns
+          )
+
+        {:allow, _mode, :fresh_summary, %Issue{} = refreshed_issue} when turn_number < max_turns ->
+          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} with a fresh summary session turn=#{turn_number}/#{max_turns}")
+
+          AppServer.stop_session(app_session)
+
+          with {:ok, next_session} <- AppServer.start_session(workspace) do
+            try do
+              do_run_codex_turns(
+                next_session,
+                workspace,
+                refreshed_issue,
+                codex_update_recipient,
+                opts,
+                continuation_decider,
+                turn_number + 1,
+                max_turns
+              )
+            after
+              AppServer.stop_session(next_session)
+            end
+          end
+
         {:allow, _mode, %Issue{} = refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after orchestrator approval turn=#{turn_number}/#{max_turns}")
 
@@ -136,6 +172,16 @@ defmodule SymphonyElixir.AgentRunner do
             turn_number + 1,
             max_turns
           )
+
+        {:allow, _mode, :reuse_thread, %Issue{} = refreshed_issue} ->
+          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+
+          :ok
+
+        {:allow, _mode, :fresh_summary, %Issue{} = refreshed_issue} ->
+          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+
+          :ok
 
         {:allow, _mode, %Issue{} = refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")

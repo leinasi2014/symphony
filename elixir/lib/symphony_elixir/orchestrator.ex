@@ -49,7 +49,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @spec request_continuation(GenServer.server(), String.t(), pos_integer()) ::
-          {:allow, :probe | :default, Issue.t()} | {:deny, term()}
+          {:allow, :probe | :default, :reuse_thread | :fresh_summary, Issue.t()} | {:deny, term()}
   def request_continuation(server, issue_id, turn_number)
       when is_binary(issue_id) and is_integer(turn_number) and turn_number > 0 do
     request_continuation(server, issue_id, turn_number, &Tracker.fetch_issue_states_by_ids/1)
@@ -61,7 +61,8 @@ defmodule SymphonyElixir.Orchestrator do
           String.t(),
           pos_integer(),
           ([String.t()] -> term())
-        ) :: {:allow, :probe | :default, Issue.t()} | {:deny, term()}
+        ) ::
+          {:allow, :probe | :default, :reuse_thread | :fresh_summary, Issue.t()} | {:deny, term()}
   def request_continuation_for_test(server, issue_id, turn_number, issue_fetcher)
       when is_binary(issue_id) and is_integer(turn_number) and turn_number > 0 and
              is_function(issue_fetcher, 1) do
@@ -1471,17 +1472,19 @@ defmodule SymphonyElixir.Orchestrator do
       |> update_running_issue_if_present(refreshed_issue)
       |> then(fn updated_state ->
         mode = ledger_mode_for_issue(updated_state.guardrail_ledger, issue_id)
+        session_strategy = continuation_session_strategy(updated_state.guardrail_ledger, issue_id)
 
         update_guardrail_ledger(updated_state, issue_id, fn entry ->
           entry
           |> Map.put(:stop_reason, nil)
-          |> Map.put(:last_continuation_decision, {:allow, mode})
+          |> Map.put(:last_continuation_decision, {:allow, mode, session_strategy})
           |> Map.put(:last_turn_started_at, DateTime.utc_now())
         end)
       end)
 
     mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
-    {{:allow, mode, refreshed_issue}, state}
+    session_strategy = continuation_session_strategy(state.guardrail_ledger, issue_id)
+    {{:allow, mode, session_strategy, refreshed_issue}, state}
   end
 
   defp update_running_issue_if_present(%State{} = state, %Issue{} = issue) do
@@ -1749,6 +1752,39 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp guardrail_budget_for_entry(_entry) do
     Config.guardrails_default_budget()
+  end
+
+  defp continuation_session_strategy(guardrail_ledger, issue_id) when is_map(guardrail_ledger) do
+    case Map.get(guardrail_ledger, issue_id) do
+      %{} = entry ->
+        if fresh_summary_continuation?(entry) do
+          :fresh_summary
+        else
+          :reuse_thread
+        end
+
+      _ ->
+        :reuse_thread
+    end
+  end
+
+  defp continuation_session_strategy(_guardrail_ledger, _issue_id), do: :reuse_thread
+
+  defp fresh_summary_continuation?(entry) when is_map(entry) do
+    if Config.guardrails_enabled?() do
+      budget = guardrail_budget_for_entry(entry)
+      total_tokens = Map.get(entry, :total_tokens, 0)
+      input_tokens = Map.get(entry, :total_input_tokens, 0)
+      soft_total_tokens = Map.get(budget, :soft_total_tokens, 9_223_372_036_854_775_807)
+      soft_input_tokens = Map.get(budget, :soft_input_tokens, 9_223_372_036_854_775_807)
+
+      total_tokens >= soft_total_tokens or
+        input_tokens >= soft_input_tokens or
+        not is_nil(Map.get(entry, :last_guardrail_reason)) or
+        not is_nil(Map.get(entry, :stop_reason))
+    else
+      false
+    end
   end
 
   defp guardrail_snapshot(%State{} = state, issue_id, hold \\ nil) when is_binary(issue_id) do
