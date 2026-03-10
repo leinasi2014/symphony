@@ -33,6 +33,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       running: %{},
       guardrail_ledger: %{},
+      guardrail_holds: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
@@ -77,6 +78,7 @@ defmodule SymphonyElixir.Orchestrator do
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
       guardrail_ledger: %{},
+      guardrail_holds: load_persisted_guardrail_holds(),
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
@@ -124,11 +126,15 @@ defmodule SymphonyElixir.Orchestrator do
         session_id = running_entry_session_id(running_entry)
 
         state =
-          case reason do
-            :normal ->
+          cond do
+            guardrail_hold_active?(state, issue_id) ->
+              Logger.info("Agent task finished for held issue_id=#{issue_id} session_id=#{session_id}; suppressing retry")
+              release_issue_claim(state, issue_id)
+
+            reason == :normal ->
               handle_normal_worker_exit(state, issue_id, running_entry, session_id)
 
-            _ ->
+            true ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
@@ -159,14 +165,15 @@ defmodule SymphonyElixir.Orchestrator do
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
         state =
-          state
+          %{state | running: Map.put(running, issue_id, updated_running_entry)}
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
           |> sync_guardrail_ledger_from_running_entry(issue_id, updated_running_entry)
           |> maybe_seed_progress_baseline(issue_id, updated_running_entry, update)
+          |> maybe_apply_realtime_guardrail_stop(issue_id)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -189,6 +196,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
+    state = reconcile_guardrail_holds(state)
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(),
@@ -309,6 +317,11 @@ defmodule SymphonyElixir.Orchestrator do
   @spec guardrail_ledger_for_test(map()) :: map()
   def guardrail_ledger_for_test(%State{} = state), do: state.guardrail_ledger
   def guardrail_ledger_for_test(state) when is_map(state), do: Map.get(state, :guardrail_ledger, %{})
+
+  @doc false
+  @spec guardrail_holds_for_test(map()) :: map()
+  def guardrail_holds_for_test(%State{} = state), do: state.guardrail_holds
+  def guardrail_holds_for_test(state) when is_map(state), do: Map.get(state, :guardrail_holds, %{})
 
   @doc false
   @spec put_guardrail_dispatch_for_test(map(), Issue.t(), DateTime.t(), atom()) :: map()
@@ -514,6 +527,7 @@ defmodule SymphonyElixir.Orchestrator do
     candidate_issue?(issue, active_states, terminal_states) and
       issue_executable_under_guardrails?(issue) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !guardrail_hold_active?(state, issue.id) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -788,22 +802,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_candidate_issues() do
-      {:ok, issues} ->
-        issues
-        |> find_issue_by_id(issue_id)
-        |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+    if guardrail_hold_active?(state, issue_id) do
+      {:noreply, release_issue_claim(state, issue_id)}
+    else
+      case Tracker.fetch_candidate_issues() do
+        {:ok, issues} ->
+          issues
+          |> find_issue_by_id(issue_id)
+          |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
 
-      {:error, reason} ->
-        Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+        {:error, reason} ->
+          Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
 
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue_id,
-           attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-         )}
+          {:noreply,
+           schedule_issue_retry(
+             state,
+             issue_id,
+             attempt + 1,
+             Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+           )}
+      end
     end
   end
 
@@ -811,6 +829,9 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
 
     cond do
+      guardrail_hold_active?(state, issue_id) ->
+        {:noreply, release_issue_claim(state, issue_id)}
+
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
@@ -880,42 +901,281 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_normal_worker_exit(state, issue_id, running_entry, session_id) do
-    case get_in(state.guardrail_ledger, [issue_id, :last_continuation_decision]) do
-      {:deny, :issue_not_active} ->
-        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied because issue is no longer active")
+    cond do
+      guardrail_hold_active?(state, issue_id) ->
+        Logger.info("Agent task completed for held issue_id=#{issue_id} session_id=#{session_id}; suppressing continuation retry")
 
         state
         |> complete_issue(issue_id)
         |> release_issue_claim(issue_id)
 
-      {:deny, :issue_missing} ->
-        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied because issue is missing")
+      true ->
+        case get_in(state.guardrail_ledger, [issue_id, :last_continuation_decision]) do
+          {:deny, :issue_not_active} ->
+            Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied because issue is no longer active")
 
-        state
-        |> complete_issue(issue_id)
-        |> release_issue_claim(issue_id)
+            state
+            |> complete_issue(issue_id)
+            |> release_issue_claim(issue_id)
 
-      {:deny, reason} ->
-        Logger.warning("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied with retryable reason=#{inspect(reason)}")
+          {:deny, :issue_missing} ->
+            Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied because issue is missing")
 
-        schedule_issue_retry(state, issue_id, nil, %{
-          identifier: running_entry.identifier,
-          error: "continuation denied: #{inspect(reason)}",
-          retry_kind: :failure
-        })
+            state
+            |> complete_issue(issue_id)
+            |> release_issue_claim(issue_id)
 
-      _ ->
-        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+          {:deny, reason} ->
+            Logger.warning("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; continuation denied with retryable reason=#{inspect(reason)}")
 
-        state
-        |> complete_issue(issue_id)
-        |> schedule_issue_retry(issue_id, 1, %{
-          identifier: running_entry.identifier,
-          delay_type: :continuation,
-          retry_kind: :continuation
-        })
+            schedule_issue_retry(state, issue_id, nil, %{
+              identifier: running_entry.identifier,
+              error: "continuation denied: #{inspect(reason)}",
+              retry_kind: :failure
+            })
+
+          _ ->
+            case evaluate_continuation_retry_guardrail_reason(state, issue_id) do
+              nil ->
+                Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+                state
+                |> complete_issue(issue_id)
+                |> schedule_issue_retry(issue_id, 1, %{
+                  identifier: running_entry.identifier,
+                  delay_type: :continuation,
+                  retry_kind: :continuation
+                })
+
+              reason ->
+                state = maybe_apply_guardrail_result(state, issue_id, reason, :continuation_retry)
+
+                if guardrail_hold_active?(state, issue_id) do
+                  state
+                  |> complete_issue(issue_id)
+                  |> release_issue_claim(issue_id)
+                else
+                  Logger.info("Observed continuation retry guardrail issue_id=#{issue_id} session_id=#{session_id}; continuing in observe mode")
+
+                  state
+                  |> complete_issue(issue_id)
+                  |> schedule_issue_retry(issue_id, 1, %{
+                    identifier: running_entry.identifier,
+                    delay_type: :continuation,
+                    retry_kind: :continuation
+                  })
+                end
+            end
+        end
     end
   end
+
+  defp guardrail_hold_active?(%State{} = state, issue_id) when is_binary(issue_id) do
+    Map.has_key?(state.guardrail_holds, issue_id)
+  end
+
+  defp guardrail_hold_active?(_state, _issue_id), do: false
+
+  defp reconcile_guardrail_holds(%State{guardrail_holds: holds} = state) when map_size(holds) == 0,
+    do: state
+
+  defp reconcile_guardrail_holds(%State{} = state) do
+    hold_ids = Map.keys(state.guardrail_holds)
+    active_states = active_state_set()
+    terminal_states = terminal_state_set()
+
+    case Tracker.fetch_issue_states_by_ids(hold_ids) do
+      {:ok, issues} ->
+        issue_map = Map.new(issues, &{&1.id, &1})
+
+        Enum.reduce(hold_ids, state, fn issue_id, state_acc ->
+          case Map.get(issue_map, issue_id) do
+            %Issue{} = issue ->
+              if terminal_issue_state?(issue.state, terminal_states) or
+                   !active_issue_state?(issue.state, active_states) do
+                clear_guardrail_hold(state_acc, issue_id)
+              else
+                state_acc
+              end
+
+            nil ->
+              state_acc
+          end
+        end)
+
+      {:error, reason} ->
+        Logger.debug("Failed to reconcile guardrail holds: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp put_guardrail_hold(%State{} = state, issue_id, hold) when is_binary(issue_id) and is_map(hold) do
+    %{state | guardrail_holds: Map.put(state.guardrail_holds, issue_id, hold)}
+  end
+
+  defp clear_guardrail_hold(%State{} = state, issue_id) when is_binary(issue_id) do
+    state
+    |> then(fn updated_state ->
+      case Map.get(updated_state.guardrail_holds, issue_id) do
+        %{identifier: identifier} when is_binary(identifier) ->
+          delete_persisted_guardrail_hold(identifier)
+          updated_state
+
+        _ ->
+          updated_state
+      end
+    end)
+    |> then(fn updated_state ->
+      %{updated_state | guardrail_holds: Map.delete(updated_state.guardrail_holds, issue_id)}
+    end)
+  end
+
+  defp load_persisted_guardrail_holds do
+    workspace_root = Config.workspace_root()
+
+    if File.dir?(workspace_root) do
+      workspace_root
+      |> Path.join("*/shared/guardrail_state.json")
+      |> Path.wildcard()
+      |> Enum.reduce(%{}, fn path, holds ->
+        case File.read(path) do
+          {:ok, body} ->
+            case Jason.decode(body) do
+              {:ok, %{"issue_id" => issue_id} = hold} when is_binary(issue_id) ->
+                Map.put(holds, issue_id, decoded_guardrail_hold(hold))
+
+              _ ->
+                holds
+            end
+
+          _ ->
+            holds
+        end
+      end)
+    else
+      %{}
+    end
+  end
+
+  defp decoded_guardrail_hold(hold) do
+    %{
+      issue_id: hold["issue_id"],
+      identifier: hold["identifier"],
+      stop_reason: hold["stop_reason"],
+      held_at: hold["held_at"],
+      input_tokens: hold["input_tokens"] || 0,
+      total_tokens: hold["total_tokens"] || 0,
+      writeback: Map.get(hold, "writeback", %{})
+    }
+  end
+
+  defp persist_guardrail_hold(%{identifier: identifier} = hold) when is_binary(identifier) do
+    shared_dir = Path.join(Workspace.path_for_issue(identifier), "shared")
+    File.mkdir_p!(shared_dir)
+
+    payload = %{
+      issue_id: hold.issue_id,
+      identifier: identifier,
+      stop_reason: format_guardrail_reason(hold.stop_reason),
+      held_at: hold.held_at,
+      input_tokens: hold.input_tokens,
+      total_tokens: hold.total_tokens,
+      writeback: hold.writeback
+    }
+
+    File.write!(Path.join(shared_dir, "guardrail_state.json"), Jason.encode!(payload))
+    :ok
+  end
+
+  defp delete_persisted_guardrail_hold(identifier) when is_binary(identifier) do
+    path = Path.join([Workspace.path_for_issue(identifier), "shared", "guardrail_state.json"])
+    File.rm(path)
+    :ok
+  end
+
+  defp apply_guardrail_stop(%State{} = state, issue_id, reason, trigger) do
+    running_entry = Map.get(state.running, issue_id)
+    hold = build_guardrail_hold(state, issue_id, running_entry, reason, trigger)
+
+    state =
+      state
+      |> update_guardrail_ledger(issue_id, fn entry ->
+        entry
+        |> Map.put(:stop_reason, reason)
+        |> Map.put(:last_guardrail_reason, reason)
+      end)
+      |> put_guardrail_hold(issue_id, hold)
+
+    :ok = persist_guardrail_hold(hold)
+    state = write_guardrail_stop(state, hold)
+
+    if trigger == :realtime and is_map(running_entry) and is_pid(running_entry.pid) do
+      terminate_task(running_entry.pid)
+    end
+
+    state
+  end
+
+  defp build_guardrail_hold(%State{} = state, issue_id, running_entry, reason, _trigger) do
+    ledger_entry = Map.get(state.guardrail_ledger, issue_id, %{})
+
+    identifier =
+      cond do
+        is_map(running_entry) and is_binary(running_entry.identifier) -> running_entry.identifier
+        is_binary(ledger_entry[:issue_identifier]) -> ledger_entry[:issue_identifier]
+        true -> issue_id
+      end
+
+    %{
+      issue_id: issue_id,
+      identifier: identifier,
+      mode: Map.get(ledger_entry, :mode, initial_guardrail_mode()),
+      stop_reason: reason,
+      held_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+      input_tokens: Map.get(ledger_entry, :total_input_tokens, 0),
+      total_tokens: Map.get(ledger_entry, :total_tokens, 0),
+      writeback: %{}
+    }
+  end
+
+  defp write_guardrail_stop(%State{} = state, hold) do
+    comment_result =
+      if Config.guardrails_create_comment_on_stop?() do
+        case Tracker.create_comment(hold.issue_id, guardrail_stop_comment(hold)) do
+          :ok -> "ok"
+          {:error, reason} -> "failed: #{inspect(reason)}"
+        end
+      else
+        "skipped"
+      end
+
+    state_result =
+      case Tracker.update_issue_state(hold.issue_id, Config.guardrails_stop_state()) do
+        :ok -> "ok"
+        {:error, reason} -> "failed: #{inspect(reason)}"
+      end
+
+    hold = %{hold | writeback: %{"comment" => comment_result, "state" => state_result}}
+    :ok = persist_guardrail_hold(hold)
+    put_guardrail_hold(state, hold.issue_id, hold)
+  end
+
+  defp guardrail_stop_comment(hold) do
+    """
+    Symphony stopped this run automatically.
+
+    - reason: #{format_guardrail_reason(hold.stop_reason)}
+    - issue: #{hold.identifier}
+    - mode: #{hold.mode}
+    - total_tokens: #{hold.total_tokens}
+    - input_tokens: #{hold.input_tokens}
+    - next_action: split the ticket or resume from human review with a narrower scope
+    """
+    |> String.trim()
+  end
+
+  defp format_guardrail_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp format_guardrail_reason(reason), do: inspect(reason)
 
   defp release_issue_claim(%State{} = state, issue_id) do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
@@ -1116,47 +1376,68 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp evaluate_continuation_request(%State{} = state, issue_id, turn_number, issue_fetcher) do
-    case Map.get(state.running, issue_id) do
-      %{issue: %Issue{}} = running_entry ->
-        state =
-          state
-          |> sync_guardrail_ledger_from_running_entry(issue_id, running_entry)
-          |> mark_completed_turn(issue_id, turn_number)
-          |> update_workspace_progress(issue_id, running_entry.issue)
+    cond do
+      guardrail_hold_active?(state, issue_id) ->
+        {{:deny, :guardrail_held}, state}
 
-        case issue_fetcher.([issue_id]) do
-          {:ok, [%Issue{} = refreshed_issue | _]} ->
-            if active_issue_state?(refreshed_issue.state, active_state_set()) do
-              state =
-                state
-                |> update_running_issue_if_present(refreshed_issue)
-                |> then(fn updated_state ->
-                  mode = ledger_mode_for_issue(updated_state.guardrail_ledger, issue_id)
+      true ->
+        case Map.get(state.running, issue_id) do
+          %{issue: %Issue{}} = running_entry ->
+            state =
+              state
+              |> sync_guardrail_ledger_from_running_entry(issue_id, running_entry)
+              |> mark_completed_turn(issue_id, turn_number)
+              |> update_workspace_progress(issue_id, running_entry.issue)
 
-                  update_guardrail_ledger(updated_state, issue_id, fn entry ->
-                    entry
-                    |> Map.put(:stop_reason, nil)
-                    |> Map.put(:last_continuation_decision, {:allow, mode})
-                    |> Map.put(:last_turn_started_at, DateTime.utc_now())
-                  end)
-                end)
+            case evaluate_turn_boundary_guardrail_reason(state, issue_id) do
+              nil ->
+                handle_continuation_issue_refresh(state, issue_id, issue_fetcher)
 
-              mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
+              reason ->
+                state = maybe_apply_guardrail_result(state, issue_id, reason, :turn_boundary)
 
-              {{:allow, mode, refreshed_issue}, state}
-            else
-              deny_continuation(state, issue_id, :issue_not_active)
+                if guardrail_hold_active?(state, issue_id) do
+                  {{:deny, reason}, state}
+                else
+                  handle_continuation_issue_refresh(state, issue_id, issue_fetcher)
+                end
             end
 
-          {:ok, []} ->
-            deny_continuation(state, issue_id, :issue_missing)
+          _ ->
+            {{:deny, :issue_not_running}, state}
+        end
+    end
+  end
 
-          {:error, reason} ->
-            deny_continuation(state, issue_id, {:issue_state_refresh_failed, reason})
+  defp handle_continuation_issue_refresh(%State{} = state, issue_id, issue_fetcher) do
+    case issue_fetcher.([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} ->
+        if active_issue_state?(refreshed_issue.state, active_state_set()) do
+          state =
+            state
+            |> update_running_issue_if_present(refreshed_issue)
+            |> then(fn updated_state ->
+              mode = ledger_mode_for_issue(updated_state.guardrail_ledger, issue_id)
+
+              update_guardrail_ledger(updated_state, issue_id, fn entry ->
+                entry
+                |> Map.put(:stop_reason, nil)
+                |> Map.put(:last_continuation_decision, {:allow, mode})
+                |> Map.put(:last_turn_started_at, DateTime.utc_now())
+              end)
+            end)
+
+          mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
+          {{:allow, mode, refreshed_issue}, state}
+        else
+          deny_continuation(state, issue_id, :issue_not_active)
         end
 
-      _ ->
-        {{:deny, :issue_not_running}, state}
+      {:ok, []} ->
+        deny_continuation(state, issue_id, :issue_missing)
+
+      {:error, reason} ->
+        deny_continuation(state, issue_id, {:issue_state_refresh_failed, reason})
     end
   end
 
@@ -1297,6 +1578,102 @@ defmodule SymphonyElixir.Orchestrator do
     Config.guardrails_default_budget()
     |> Map.get(:no_progress_turn_limit, 0)
     |> Kernel.>(0)
+  end
+
+  defp maybe_apply_realtime_guardrail_stop(%State{} = state, issue_id) do
+    case evaluate_realtime_guardrail_reason(state, issue_id) do
+      nil ->
+        state
+
+      reason ->
+        maybe_apply_guardrail_result(state, issue_id, reason, :realtime)
+    end
+  end
+
+  defp evaluate_realtime_guardrail_reason(%State{} = state, issue_id) do
+    with true <- Config.guardrails_enabled?(),
+         %{total_tokens: total_tokens, total_input_tokens: input_tokens} = entry <- Map.get(state.guardrail_ledger, issue_id) do
+      budget = guardrail_budget_for_entry(entry)
+
+      cond do
+        total_tokens >= Map.get(budget, :hard_total_tokens, 9_223_372_036_854_775_807) ->
+          :hard_total_token_limit
+
+        input_tokens >= Map.get(budget, :hard_input_tokens, 9_223_372_036_854_775_807) ->
+          :hard_input_token_limit
+
+        true ->
+          nil
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp evaluate_turn_boundary_guardrail_reason(%State{} = state, issue_id) do
+    with true <- Config.guardrails_enabled?(),
+         %{total_turns: total_turns, no_progress_turns: no_progress_turns} = entry <- Map.get(state.guardrail_ledger, issue_id) do
+      budget = guardrail_budget_for_entry(entry)
+      max_total_turns = Map.get(budget, :max_total_turns_per_issue, 9_223_372_036_854_775_807)
+      no_progress_limit = Map.get(budget, :no_progress_turn_limit, 0)
+
+      cond do
+        total_turns >= max_total_turns ->
+          :max_total_turns_per_issue
+
+        no_progress_limit > 0 and no_progress_turns >= no_progress_limit ->
+          :no_progress_turn_limit
+
+        true ->
+          nil
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp evaluate_continuation_retry_guardrail_reason(%State{} = state, issue_id) do
+    with true <- Config.guardrails_enabled?(),
+         %{continuation_runs: continuation_runs} = entry <- Map.get(state.guardrail_ledger, issue_id) do
+      budget = guardrail_budget_for_entry(entry)
+      max_continuation_runs = Map.get(budget, :max_continuation_runs_per_issue, 9_223_372_036_854_775_807)
+
+      if continuation_runs >= max_continuation_runs do
+        :max_continuation_runs_per_issue
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp maybe_apply_guardrail_result(%State{} = state, issue_id, reason, trigger) do
+    state =
+      update_guardrail_ledger(state, issue_id, fn entry ->
+        entry
+        |> Map.put(:last_guardrail_reason, reason)
+        |> Map.put(:last_warning_at, DateTime.utc_now())
+      end)
+
+    case Config.guardrails_mode() do
+      "observe" ->
+        Logger.warning("Observed guardrail hit issue_id=#{issue_id} trigger=#{trigger} reason=#{inspect(reason)}")
+        state
+
+      "enforce" ->
+        Logger.warning("Enforcing guardrail stop issue_id=#{issue_id} trigger=#{trigger} reason=#{inspect(reason)}")
+        apply_guardrail_stop(state, issue_id, reason, trigger)
+
+      _ ->
+        state
+    end
+  end
+
+  defp guardrail_budget_for_entry(%{mode: :probe}) do
+    Config.guardrails_probe_budget()
+  end
+
+  defp guardrail_budget_for_entry(_entry) do
+    Config.guardrails_default_budget()
   end
 
   defp maybe_seed_progress_baseline(%State{} = state, issue_id, %{workspace: workspace}, update)

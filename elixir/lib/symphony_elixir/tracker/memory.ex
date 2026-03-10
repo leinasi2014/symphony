@@ -37,14 +37,26 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
-    send_event({:memory_tracker_comment, issue_id, body})
-    :ok
+    case Application.get_env(:symphony_elixir, :memory_tracker_comment_result, :ok) do
+      :ok ->
+        send_event({:memory_tracker_comment, issue_id, body})
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
-    send_event({:memory_tracker_state_update, issue_id, state_name})
-    :ok
+    case Application.get_env(:symphony_elixir, :memory_tracker_state_update_result, :ok) do
+      :ok ->
+        send_event({:memory_tracker_state_update, issue_id, state_name})
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp configured_issues do

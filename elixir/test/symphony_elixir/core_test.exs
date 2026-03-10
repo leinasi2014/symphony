@@ -1392,6 +1392,588 @@ defmodule SymphonyElixir.CoreTest do
     assert error =~ "continuation denied"
   end
 
+  test "observe mode records hard token hits without stopping the worker" do
+    workspace_root = Path.join(System.tmp_dir!(), "guardrail-observe-#{System.unique_integer([:positive])}")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_guardrails: %{
+          enabled: true,
+          mode: "observe",
+          stop_state: "Human Review",
+          probe: %{
+            hard_total_tokens: 10,
+            hard_input_tokens: 10,
+            max_total_turns_per_issue: 2,
+            soft_total_tokens: 5,
+            soft_input_tokens: 5
+          }
+        }
+      )
+
+      issue_id = "issue-observe-hard-limit"
+      orchestrator_name = Module.concat(__MODULE__, :ObserveHardLimitOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      worker_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      initial_state = :sys.get_state(pid)
+      ref = Process.monitor(worker_pid)
+
+      running_entry = %{
+        pid: worker_pid,
+        ref: ref,
+        identifier: "MT-816",
+        issue: %Issue{id: issue_id, identifier: "MT-816", state: "In Progress"},
+        session_id: "thread-observe",
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        codex_last_reported_input_tokens: 0,
+        codex_last_reported_output_tokens: 0,
+        codex_last_reported_total_tokens: 0,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        %{initial_state | running: %{issue_id => running_entry}, claimed: MapSet.new([issue_id])}
+      end)
+
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "thread/tokenUsage/updated",
+             "params" => %{
+               "tokenUsage" => %{
+                 "total" => %{"input_tokens" => 12, "output_tokens" => 1, "total_tokens" => 13}
+               }
+             }
+           },
+           timestamp: DateTime.utc_now()
+         }}
+      )
+
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+      assert Process.alive?(worker_pid)
+      assert Orchestrator.guardrail_holds_for_test(state) == %{}
+
+      assert get_in(Orchestrator.guardrail_ledger_for_test(state), [issue_id, :last_guardrail_reason]) ==
+               :hard_total_token_limit
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "enforce mode stops the worker persists the hold and suppresses retry" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "guardrail-stop-#{System.unique_integer([:positive])}")
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_guardrails: %{
+          enabled: true,
+          mode: "enforce",
+          stop_state: "Human Review",
+          probe: %{
+            hard_total_tokens: 10,
+            hard_input_tokens: 10,
+            max_total_turns_per_issue: 2,
+            soft_total_tokens: 5,
+            soft_input_tokens: 5
+          }
+        }
+      )
+
+      issue_id = "issue-enforce-hard-limit"
+      identifier = "MT-817"
+      workspace = Path.join(workspace_root, identifier)
+      File.mkdir_p!(workspace)
+
+      orchestrator_name = Module.concat(__MODULE__, :EnforceHardLimitOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      worker_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      initial_state = :sys.get_state(pid)
+      ref = Process.monitor(worker_pid)
+
+      running_entry = %{
+        pid: worker_pid,
+        ref: ref,
+        identifier: identifier,
+        issue: %Issue{id: issue_id, identifier: identifier, state: "In Progress"},
+        workspace: workspace,
+        session_id: "thread-enforce",
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        codex_last_reported_input_tokens: 0,
+        codex_last_reported_output_tokens: 0,
+        codex_last_reported_total_tokens: 0,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        %{initial_state | running: %{issue_id => running_entry}, claimed: MapSet.new([issue_id])}
+      end)
+
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "thread/tokenUsage/updated",
+             "params" => %{
+               "tokenUsage" => %{
+                 "total" => %{"input_tokens" => 12, "output_tokens" => 1, "total_tokens" => 13}
+               }
+             }
+           },
+           timestamp: DateTime.utc_now()
+         }}
+      )
+
+      assert_receive {:memory_tracker_comment, ^issue_id, body}, 1_000
+      assert body =~ "hard_total_token_limit"
+      assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 1_000
+
+      Process.sleep(100)
+      state = :sys.get_state(pid)
+
+      refute Process.alive?(worker_pid)
+      refute Map.has_key?(state.retry_attempts, issue_id)
+      assert Map.has_key?(Orchestrator.guardrail_holds_for_test(state), issue_id)
+      assert File.exists?(Path.join([workspace, "shared", "guardrail_state.json"]))
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "continuation ceiling in enforce mode holds the issue instead of scheduling continuation retry" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "guardrail-continuation-#{System.unique_integer([:positive])}")
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_guardrails: %{
+          enabled: true,
+          mode: "enforce",
+          stop_state: "Human Review",
+          default: %{
+            max_total_turns_per_issue: 3,
+            max_continuation_runs_per_issue: 1,
+            no_progress_turn_limit: 1,
+            soft_total_tokens: 100,
+            hard_total_tokens: 200,
+            soft_input_tokens: 100,
+            hard_input_tokens: 200
+          }
+        }
+      )
+
+      issue_id = "issue-continuation-ceiling"
+      ref = make_ref()
+      orchestrator_name = Module.concat(__MODULE__, :ContinuationCeilingOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: "MT-818",
+        issue: %Issue{id: issue_id, identifier: "MT-818", state: "In Progress"},
+        started_at: DateTime.utc_now()
+      }
+
+      guardrail_ledger = %{
+        issue_id => %{
+          issue_identifier: "MT-818",
+          mode: :default,
+          stop_reason: nil,
+          total_input_tokens: 0,
+          total_output_tokens: 0,
+          total_tokens: 0,
+          total_turns: 2,
+          continuation_runs: 1,
+          no_progress_turns: 0,
+          first_started_at: DateTime.utc_now(),
+          last_turn_started_at: DateTime.utc_now(),
+          last_turn_completed_at: DateTime.utc_now(),
+          last_progress_fingerprint: nil,
+          last_warning_at: nil,
+          progress_baseline_pending: false,
+          last_completed_turn_number: 2,
+          last_continuation_decision: nil
+        }
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        %{
+          initial_state
+          | running: %{issue_id => running_entry},
+            claimed: MapSet.new([issue_id]),
+            retry_attempts: %{},
+            guardrail_ledger: guardrail_ledger
+        }
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 1_000
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      refute Map.has_key?(state.retry_attempts, issue_id)
+      assert Map.has_key?(Orchestrator.guardrail_holds_for_test(state), issue_id)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "turn-boundary total-turn ceiling in enforce mode denies continuation and creates a hold" do
+    workspace_root = Path.join(System.tmp_dir!(), "guardrail-total-turns-#{System.unique_integer([:positive])}")
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_guardrails: %{
+          enabled: true,
+          mode: "enforce",
+          stop_state: "Human Review",
+          probe: %{
+            max_total_turns_per_issue: 1,
+            hard_total_tokens: 100,
+            hard_input_tokens: 100,
+            soft_total_tokens: 50,
+            soft_input_tokens: 50
+          }
+        }
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :TotalTurnGuardrailOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      issue = %Issue{
+        id: "issue-total-turn-limit",
+        identifier: "MT-821",
+        title: "Total turn ceiling",
+        description: "Turn-boundary ceiling should hold the issue",
+        state: "In Progress"
+      }
+
+      running_entry = %{
+        pid: self(),
+        ref: make_ref(),
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "thread-total-turn",
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        started_at: DateTime.utc_now()
+      }
+
+      initial_state = :sys.get_state(pid)
+
+      :sys.replace_state(pid, fn _ ->
+        %{initial_state | running: %{issue.id => running_entry}, claimed: MapSet.new([issue.id])}
+      end)
+
+      assert {:deny, :max_total_turns_per_issue} =
+               Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
+                 {:ok, [%{issue | state: "In Progress"}]}
+               end)
+
+      assert_receive {:memory_tracker_state_update, "issue-total-turn-limit", "Human Review"}, 1_000
+      state = :sys.get_state(pid)
+      assert Map.has_key?(Orchestrator.guardrail_holds_for_test(state), issue.id)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "turn-boundary no-progress ceiling in observe mode records the hit but still allows continuation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_guardrails: %{
+        enabled: true,
+        mode: "observe",
+        stop_state: "Human Review",
+        default: %{
+          max_total_turns_per_issue: 5,
+          max_continuation_runs_per_issue: 5,
+          no_progress_turn_limit: 1,
+          soft_total_tokens: 100,
+          hard_total_tokens: 200,
+          soft_input_tokens: 100,
+          hard_input_tokens: 200
+        }
+      }
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :NoProgressObserveOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    issue = %Issue{
+      id: "issue-no-progress-observe",
+      identifier: "MT-822",
+      title: "No progress observe",
+      description: "Observe mode should not stop the issue",
+      state: "In Progress"
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-no-progress",
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    ledger = %{
+      issue.id => %{
+        issue_identifier: issue.identifier,
+        mode: :default,
+        stop_reason: nil,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_tokens: 0,
+        total_turns: 1,
+        continuation_runs: 0,
+        no_progress_turns: 1,
+        first_started_at: DateTime.utc_now(),
+        last_turn_started_at: DateTime.utc_now(),
+        last_turn_completed_at: DateTime.utc_now(),
+        last_progress_fingerprint: nil,
+        last_warning_at: nil,
+        progress_baseline_pending: false,
+        last_completed_turn_number: 1,
+        last_continuation_decision: nil
+      }
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{initial_state | running: %{issue.id => running_entry}, claimed: MapSet.new([issue.id]), guardrail_ledger: ledger}
+    end)
+
+    assert {:allow, :default, _} =
+             Orchestrator.request_continuation_for_test(pid, issue.id, 2, fn [_issue_id] ->
+               {:ok, [%{issue | state: "In Progress"}]}
+             end)
+
+    state = :sys.get_state(pid)
+    refute Map.has_key?(Orchestrator.guardrail_holds_for_test(state), issue.id)
+
+    assert get_in(Orchestrator.guardrail_ledger_for_test(state), [issue.id, :last_guardrail_reason]) ==
+             :no_progress_turn_limit
+  end
+
+  test "startup reloads persisted guardrail holds" do
+    workspace_root = Path.join(System.tmp_dir!(), "guardrail-reload-#{System.unique_integer([:positive])}")
+
+    try do
+      hold_dir = Path.join([workspace_root, "MT-819", "shared"])
+      File.mkdir_p!(hold_dir)
+
+      File.write!(
+        Path.join(hold_dir, "guardrail_state.json"),
+        Jason.encode!(%{
+          "issue_id" => "issue-reloaded-hold",
+          "identifier" => "MT-819",
+          "stop_reason" => "hard_total_token_limit",
+          "held_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+          "input_tokens" => 99,
+          "total_tokens" => 100,
+          "writeback" => %{"comment" => "ok", "state" => "failed"}
+        })
+      )
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :ReloadedGuardrailHoldOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      state = :sys.get_state(pid)
+      hold = Orchestrator.guardrail_holds_for_test(state)["issue-reloaded-hold"]
+
+      assert hold.identifier == "MT-819"
+      assert hold.stop_reason == "hard_total_token_limit"
+      assert hold.total_tokens == 100
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "state writeback failure still leaves the issue held" do
+    workspace_root = Path.join(System.tmp_dir!(), "guardrail-writeback-#{System.unique_integer([:positive])}")
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+      Application.put_env(:symphony_elixir, :memory_tracker_state_update_result, {:error, :boom})
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_guardrails: %{
+          enabled: true,
+          mode: "enforce",
+          stop_state: "Human Review",
+          probe: %{
+            hard_total_tokens: 10,
+            hard_input_tokens: 10,
+            max_total_turns_per_issue: 2,
+            soft_total_tokens: 5,
+            soft_input_tokens: 5
+          }
+        }
+      )
+
+      issue_id = "issue-writeback-failure"
+      identifier = "MT-820"
+      workspace = Path.join(workspace_root, identifier)
+      File.mkdir_p!(workspace)
+
+      orchestrator_name = Module.concat(__MODULE__, :WritebackFailureOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      worker_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      initial_state = :sys.get_state(pid)
+      ref = Process.monitor(worker_pid)
+
+      running_entry = %{
+        pid: worker_pid,
+        ref: ref,
+        identifier: identifier,
+        issue: %Issue{id: issue_id, identifier: identifier, state: "In Progress"},
+        workspace: workspace,
+        session_id: "thread-writeback",
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        codex_last_reported_input_tokens: 0,
+        codex_last_reported_output_tokens: 0,
+        codex_last_reported_total_tokens: 0,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        %{initial_state | running: %{issue_id => running_entry}, claimed: MapSet.new([issue_id])}
+      end)
+
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "thread/tokenUsage/updated",
+             "params" => %{
+               "tokenUsage" => %{
+                 "total" => %{"input_tokens" => 12, "output_tokens" => 1, "total_tokens" => 13}
+               }
+             }
+           },
+           timestamp: DateTime.utc_now()
+         }}
+      )
+
+      assert_receive {:memory_tracker_comment, ^issue_id, _body}, 1_000
+      Process.sleep(100)
+      state = :sys.get_state(pid)
+      hold = Orchestrator.guardrail_holds_for_test(state)[issue_id]
+
+      assert hold.writeback["state"] =~ "failed"
+      assert File.exists?(Path.join([workspace, "shared", "guardrail_state.json"]))
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
