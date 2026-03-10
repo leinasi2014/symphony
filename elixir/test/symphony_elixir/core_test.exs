@@ -912,6 +912,364 @@ defmodule SymphonyElixir.CoreTest do
     assert ledger.total_turns == 1
   end
 
+  test "workspace progress changes promote probe mode to default during continuation" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "workspace-progress-ledger-#{System.unique_integer([:positive])}"
+      )
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkspaceProgressOrchestrator)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        tracker_project_slug: "project",
+        codex_command: "/bin/sh app-server",
+        agent_guardrails: %{
+          enabled: true,
+          mode: "observe",
+          stop_state: "Human Review",
+          default: %{no_progress_turn_limit: 1}
+        }
+      )
+
+      workspace = Path.join(workspace_root, "MT-812")
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\n")
+      System.cmd("git", ["-C", workspace, "init", "-b", "main"])
+      System.cmd("git", ["-C", workspace, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", workspace, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", workspace, "add", "tracked.txt"])
+      System.cmd("git", ["-C", workspace, "commit", "-m", "initial"])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      issue = %Issue{
+        id: "issue-progress-promotion",
+        identifier: "MT-812",
+        title: "Workspace progress",
+        description: "Probe should promote after changed fingerprint",
+        state: "In Progress"
+      }
+
+      running_entry = %{
+        pid: self(),
+        ref: make_ref(),
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "thread-progress",
+        codex_input_tokens: 1,
+        codex_output_tokens: 1,
+        codex_total_tokens: 2,
+        started_at: DateTime.utc_now()
+      }
+
+      initial_state = :sys.get_state(pid)
+
+      :sys.replace_state(pid, fn _ ->
+        %{
+          initial_state
+          | running: %{issue.id => running_entry},
+            claimed: MapSet.new([issue.id])
+        }
+      end)
+
+      {:ok, baseline_fingerprint} = SymphonyElixir.WorkspaceProgress.capture(workspace)
+
+      send(
+        pid,
+        {:codex_worker_update, issue.id,
+         %{
+           event: :workspace_ready,
+           workspace: workspace,
+           progress_fingerprint: baseline_fingerprint,
+           timestamp: DateTime.utc_now()
+         }}
+      )
+
+      assert {:allow, :probe, _} =
+               Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
+                 {:ok, [%{issue | state: "In Progress"}]}
+               end)
+
+      ledger = Orchestrator.guardrail_ledger_for_test(:sys.get_state(pid))[issue.id]
+      assert ledger.mode == :probe
+      assert ledger.no_progress_turns == 0
+
+      File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\nthree\n")
+
+      assert {:allow, :default, _} =
+               Orchestrator.request_continuation_for_test(pid, issue.id, 2, fn [_issue_id] ->
+                 {:ok, [%{issue | state: "In Progress"}]}
+               end)
+
+      ledger = Orchestrator.guardrail_ledger_for_test(:sys.get_state(pid))[issue.id]
+      assert ledger.mode == :default
+      assert ledger.no_progress_turns == 0
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "first changed completed turn promotes probe mode from dispatch baseline" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "workspace-progress-first-turn-#{System.unique_integer([:positive])}"
+      )
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkspaceFirstTurnOrchestrator)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        tracker_project_slug: "project",
+        codex_command: "/bin/sh app-server",
+        agent_guardrails: %{
+          enabled: true,
+          mode: "observe",
+          stop_state: "Human Review",
+          default: %{no_progress_turn_limit: 1}
+        }
+      )
+
+      workspace = Path.join(workspace_root, "MT-813")
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\n")
+      System.cmd("git", ["-C", workspace, "init", "-b", "main"])
+      System.cmd("git", ["-C", workspace, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", workspace, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", workspace, "add", "tracked.txt"])
+      System.cmd("git", ["-C", workspace, "commit", "-m", "initial"])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      issue = %Issue{
+        id: "issue-progress-first-turn",
+        identifier: "MT-813",
+        title: "Workspace progress first turn",
+        description: "Probe should promote on the first changed turn",
+        state: "In Progress"
+      }
+
+      initial_state = :sys.get_state(pid)
+      started_at = DateTime.utc_now()
+
+      _state =
+        Orchestrator.put_guardrail_dispatch_for_test(initial_state, issue, started_at, :initial)
+
+      running_entry = %{
+        pid: self(),
+        ref: make_ref(),
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "thread-progress-first",
+        workspace: workspace,
+        codex_input_tokens: 1,
+        codex_output_tokens: 1,
+        codex_total_tokens: 2,
+        started_at: started_at
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        %{
+          initial_state
+          | running: %{issue.id => running_entry},
+            claimed: MapSet.new([issue.id])
+        }
+      end)
+
+      {:ok, baseline_fingerprint} = SymphonyElixir.WorkspaceProgress.capture(workspace)
+
+      send(
+        pid,
+        {:codex_worker_update, issue.id,
+         %{
+           event: :workspace_ready,
+           workspace: workspace,
+           progress_fingerprint: baseline_fingerprint,
+           timestamp: DateTime.utc_now()
+         }}
+      )
+
+      File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\nthree\n")
+
+      assert {:allow, :default, _} =
+               Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
+                 {:ok, [%{issue | state: "In Progress"}]}
+               end)
+
+      ledger = Orchestrator.guardrail_ledger_for_test(:sys.get_state(pid))[issue.id]
+      assert ledger.mode == :default
+      assert ledger.no_progress_turns == 0
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "tracker refresh failure still records workspace progress for the completed turn" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "workspace-progress-refresh-failure-#{System.unique_integer([:positive])}"
+      )
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkspaceRefreshFailureOrchestrator)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        tracker_project_slug: "project",
+        codex_command: "/bin/sh app-server",
+        agent_guardrails: %{
+          enabled: true,
+          mode: "observe",
+          stop_state: "Human Review"
+        }
+      )
+
+      workspace = Path.join(workspace_root, "MT-814")
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\n")
+      System.cmd("git", ["-C", workspace, "init", "-b", "main"])
+      System.cmd("git", ["-C", workspace, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", workspace, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", workspace, "add", "tracked.txt"])
+      System.cmd("git", ["-C", workspace, "commit", "-m", "initial"])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      issue = %Issue{
+        id: "issue-progress-refresh-failure",
+        identifier: "MT-814",
+        title: "Workspace progress refresh failure",
+        description: "Fingerprint should still be recorded",
+        state: "In Progress"
+      }
+
+      initial_state = :sys.get_state(pid)
+      started_at = DateTime.utc_now()
+      _state = Orchestrator.put_guardrail_dispatch_for_test(initial_state, issue, started_at, :initial)
+
+      running_entry = %{
+        pid: self(),
+        ref: make_ref(),
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "thread-progress-failure",
+        workspace: workspace,
+        codex_input_tokens: 1,
+        codex_output_tokens: 1,
+        codex_total_tokens: 2,
+        started_at: started_at
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        %{
+          initial_state
+          | running: %{issue.id => running_entry},
+            claimed: MapSet.new([issue.id])
+        }
+      end)
+
+      {:ok, baseline_fingerprint} = SymphonyElixir.WorkspaceProgress.capture(workspace)
+
+      send(
+        pid,
+        {:codex_worker_update, issue.id,
+         %{
+           event: :workspace_ready,
+           workspace: workspace,
+           progress_fingerprint: baseline_fingerprint,
+           timestamp: DateTime.utc_now()
+         }}
+      )
+
+      File.write!(Path.join(workspace, "tracked.txt"), "one\ntwo\nthree\n")
+
+      assert {:deny, {:issue_state_refresh_failed, :boom}} =
+               Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
+                 {:error, :boom}
+               end)
+
+      ledger = Orchestrator.guardrail_ledger_for_test(:sys.get_state(pid))[issue.id]
+      refute is_nil(ledger.last_progress_fingerprint)
+      assert ledger.total_turns == 1
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "continuation redispatch preserves the previous completed-turn progress baseline" do
+    fingerprint = %{
+      kind: :git,
+      changed_file_count: 1,
+      added_lines: 2,
+      removed_lines: 0,
+      changed_files_hash: String.duplicate("c", 64)
+    }
+
+    issue = %Issue{
+      id: "issue-progress-redispatch",
+      identifier: "MT-815",
+      state: "In Progress",
+      title: "Progress redispatch",
+      description: "Progress baseline should survive continuation redispatch"
+    }
+
+    started_at = DateTime.utc_now()
+
+    state = %Orchestrator.State{
+      guardrail_ledger: %{
+        issue.id => %{
+          issue_identifier: issue.identifier,
+          mode: :default,
+          stop_reason: nil,
+          total_input_tokens: 0,
+          total_output_tokens: 0,
+          total_tokens: 0,
+          total_turns: 1,
+          continuation_runs: 0,
+          no_progress_turns: 0,
+          first_started_at: started_at,
+          last_turn_started_at: started_at,
+          last_turn_completed_at: started_at,
+          last_progress_fingerprint: fingerprint,
+          last_warning_at: nil,
+          progress_baseline_pending: false,
+          last_completed_turn_number: 1,
+          last_continuation_decision: nil
+        }
+      }
+    }
+
+    state = Orchestrator.put_guardrail_dispatch_for_test(state, issue, started_at, :continuation)
+    ledger = Orchestrator.guardrail_ledger_for_test(state)[issue.id]
+
+    assert ledger.last_progress_fingerprint == fingerprint
+    refute ledger.progress_baseline_pending
+    assert ledger.continuation_runs == 1
+  end
+
   test "normal worker exit does not schedule continuation retry after gate denial" do
     issue_id = "issue-denied-continuation"
     ref = make_ref()

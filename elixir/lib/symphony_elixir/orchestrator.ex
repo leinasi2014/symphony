@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, Guardrails, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, Guardrails, StatusDashboard, Tracker, Workspace, WorkspaceProgress}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -163,6 +163,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
           |> sync_guardrail_ledger_from_running_entry(issue_id, updated_running_entry)
+          |> maybe_seed_progress_baseline(issue_id, updated_running_entry, update)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -666,6 +667,7 @@ defmodule SymphonyElixir.Orchestrator do
             ref: ref,
             identifier: issue.identifier,
             issue: issue,
+            workspace: nil,
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -1120,21 +1122,26 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> sync_guardrail_ledger_from_running_entry(issue_id, running_entry)
           |> mark_completed_turn(issue_id, turn_number)
+          |> update_workspace_progress(issue_id, running_entry.issue)
 
         case issue_fetcher.([issue_id]) do
           {:ok, [%Issue{} = refreshed_issue | _]} ->
             if active_issue_state?(refreshed_issue.state, active_state_set()) do
-              mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
-
               state =
                 state
                 |> update_running_issue_if_present(refreshed_issue)
-                |> update_guardrail_ledger(issue_id, fn entry ->
-                  entry
-                  |> Map.put(:stop_reason, nil)
-                  |> Map.put(:last_continuation_decision, {:allow, mode})
-                  |> Map.put(:last_turn_started_at, DateTime.utc_now())
+                |> then(fn updated_state ->
+                  mode = ledger_mode_for_issue(updated_state.guardrail_ledger, issue_id)
+
+                  update_guardrail_ledger(updated_state, issue_id, fn entry ->
+                    entry
+                    |> Map.put(:stop_reason, nil)
+                    |> Map.put(:last_continuation_decision, {:allow, mode})
+                    |> Map.put(:last_turn_started_at, DateTime.utc_now())
+                  end)
                 end)
+
+              mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
 
               {{:allow, mode, refreshed_issue}, state}
             else
@@ -1225,6 +1232,7 @@ defmodule SymphonyElixir.Orchestrator do
       last_turn_completed_at: nil,
       last_progress_fingerprint: nil,
       last_warning_at: nil,
+      progress_baseline_pending: false,
       last_completed_turn_number: 0,
       last_continuation_decision: nil
     }
@@ -1260,6 +1268,71 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_increment_continuation_runs(entry, _retry_kind), do: entry
 
+  defp update_workspace_progress(%State{} = state, issue_id, %Issue{} = issue) do
+    workspace =
+      case Map.get(state.running, issue_id) do
+        %{workspace: workspace} when is_binary(workspace) -> workspace
+        _ -> Workspace.path_for_issue(issue.identifier || issue.id)
+      end
+
+    case WorkspaceProgress.capture(workspace) do
+      {:ok, fingerprint} ->
+        update_guardrail_ledger(state, issue_id, fn entry ->
+          WorkspaceProgress.apply_fingerprint(
+            entry,
+            fingerprint,
+            no_progress_enabled: no_progress_tracking_enabled?()
+          )
+        end)
+
+      {:error, reason} ->
+        Logger.debug("Skipping workspace progress capture issue_id=#{issue_id} reason=#{inspect(reason)}")
+        state
+    end
+  end
+
+  defp update_workspace_progress(state, _issue_id, _issue), do: state
+
+  defp no_progress_tracking_enabled? do
+    Config.guardrails_default_budget()
+    |> Map.get(:no_progress_turn_limit, 0)
+    |> Kernel.>(0)
+  end
+
+  defp maybe_seed_progress_baseline(%State{} = state, issue_id, %{workspace: workspace}, update)
+       when is_binary(workspace) do
+    case get_in(state.guardrail_ledger, [issue_id, :last_progress_fingerprint]) do
+      nil ->
+        case Map.get(update, :progress_fingerprint) || Map.get(update, "progress_fingerprint") do
+          %{} = fingerprint ->
+            update_guardrail_ledger(state, issue_id, fn entry ->
+              entry
+              |> Map.put(:last_progress_fingerprint, fingerprint)
+              |> Map.put(:progress_baseline_pending, true)
+            end)
+
+          _ ->
+            case WorkspaceProgress.capture(workspace) do
+              {:ok, fingerprint} ->
+                update_guardrail_ledger(state, issue_id, fn entry ->
+                  entry
+                  |> Map.put(:last_progress_fingerprint, fingerprint)
+                  |> Map.put(:progress_baseline_pending, true)
+                end)
+
+              {:error, reason} ->
+                Logger.debug("Skipping dispatch progress baseline issue_id=#{issue_id} reason=#{inspect(reason)}")
+                state
+            end
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp maybe_seed_progress_baseline(state, _issue_id, _running_entry, _update), do: state
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
@@ -1277,6 +1350,7 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
+        workspace: workspace_for_update(Map.get(running_entry, :workspace), update),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -1307,6 +1381,9 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp workspace_for_update(_existing, %{workspace: workspace}) when is_binary(workspace), do: workspace
+  defp workspace_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,

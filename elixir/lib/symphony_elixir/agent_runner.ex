@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, Orchestrator, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, Orchestrator, PromptBuilder, Tracker, Workspace, WorkspaceProgress}
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -15,6 +15,7 @@ defmodule SymphonyElixir.AgentRunner do
       {:ok, workspace} ->
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue),
+               :ok <- send_workspace_ready(codex_update_recipient, issue, workspace),
                :ok <- run_codex_turns(workspace, issue, codex_update_recipient, opts) do
             :ok
           else
@@ -45,6 +46,30 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
+
+  defp send_workspace_ready(recipient, %Issue{id: issue_id}, workspace)
+       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
+    fingerprint =
+      case WorkspaceProgress.capture(workspace) do
+        {:ok, fingerprint} -> fingerprint
+        {:error, _reason} -> nil
+      end
+
+    send(recipient, {
+      :codex_worker_update,
+      issue_id,
+      %{
+        event: :workspace_ready,
+        workspace: workspace,
+        progress_fingerprint: fingerprint,
+        timestamp: DateTime.utc_now()
+      }
+    })
+
+    :ok
+  end
+
+  defp send_workspace_ready(_recipient, _issue, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.agent_max_turns())

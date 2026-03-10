@@ -81,6 +81,12 @@ defmodule SymphonyElixir.Workspace do
     :ok
   end
 
+  @spec path_for_issue(map() | String.t() | nil) :: Path.t()
+  def path_for_issue(issue_or_identifier) do
+    issue_context = issue_context(issue_or_identifier)
+    workspace_path_for_issue(safe_identifier(issue_context.issue_identifier))
+  end
+
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil) :: :ok | {:error, term()}
   def run_before_run_hook(workspace, issue_or_identifier) when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
