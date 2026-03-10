@@ -1094,26 +1094,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_guardrail_stop(%State{} = state, issue_id, reason, trigger) do
-    running_entry = Map.get(state.running, issue_id)
-    hold = build_guardrail_hold(state, issue_id, running_entry, reason, trigger)
-
-    state =
+    if guardrail_hold_active?(state, issue_id) do
       state
-      |> update_guardrail_ledger(issue_id, fn entry ->
-        entry
-        |> Map.put(:stop_reason, reason)
-        |> Map.put(:last_guardrail_reason, reason)
-      end)
-      |> put_guardrail_hold(issue_id, hold)
+    else
+      running_entry = Map.get(state.running, issue_id)
+      hold = build_guardrail_hold(state, issue_id, running_entry, reason, trigger)
 
-    :ok = persist_guardrail_hold(hold)
-    state = write_guardrail_stop(state, hold)
+      state =
+        state
+        |> update_guardrail_ledger(issue_id, fn entry ->
+          entry
+          |> Map.put(:stop_reason, reason)
+          |> Map.put(:last_guardrail_reason, reason)
+        end)
+        |> put_guardrail_hold(issue_id, hold)
 
-    if trigger == :realtime and is_map(running_entry) and is_pid(running_entry.pid) do
-      terminate_task(running_entry.pid)
+      :ok = persist_guardrail_hold(hold)
+
+      if trigger == :realtime and is_map(running_entry) and is_pid(running_entry.pid) do
+        terminate_task(running_entry.pid)
+      end
+
+      write_guardrail_stop(state, hold)
     end
-
-    state
   end
 
   defp build_guardrail_hold(%State{} = state, issue_id, running_entry, reason, _trigger) do
@@ -1389,19 +1392,7 @@ defmodule SymphonyElixir.Orchestrator do
               |> mark_completed_turn(issue_id, turn_number)
               |> update_workspace_progress(issue_id, running_entry.issue)
 
-            case evaluate_turn_boundary_guardrail_reason(state, issue_id) do
-              nil ->
-                handle_continuation_issue_refresh(state, issue_id, issue_fetcher)
-
-              reason ->
-                state = maybe_apply_guardrail_result(state, issue_id, reason, :turn_boundary)
-
-                if guardrail_hold_active?(state, issue_id) do
-                  {{:deny, reason}, state}
-                else
-                  handle_continuation_issue_refresh(state, issue_id, issue_fetcher)
-                end
-            end
+            handle_continuation_issue_refresh(state, issue_id, issue_fetcher)
 
           _ ->
             {{:deny, :issue_not_running}, state}
@@ -1413,22 +1404,21 @@ defmodule SymphonyElixir.Orchestrator do
     case issue_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state, active_state_set()) do
-          state =
-            state
-            |> update_running_issue_if_present(refreshed_issue)
-            |> then(fn updated_state ->
-              mode = ledger_mode_for_issue(updated_state.guardrail_ledger, issue_id)
+          state = update_running_issue_if_present(state, refreshed_issue)
 
-              update_guardrail_ledger(updated_state, issue_id, fn entry ->
-                entry
-                |> Map.put(:stop_reason, nil)
-                |> Map.put(:last_continuation_decision, {:allow, mode})
-                |> Map.put(:last_turn_started_at, DateTime.utc_now())
-              end)
-            end)
+          case evaluate_turn_boundary_guardrail_reason(state, issue_id) do
+            nil ->
+              allow_continuation(state, issue_id, refreshed_issue)
 
-          mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
-          {{:allow, mode, refreshed_issue}, state}
+            reason ->
+              state = maybe_apply_guardrail_result(state, issue_id, reason, :turn_boundary)
+
+              if guardrail_hold_active?(state, issue_id) do
+                deny_continuation(state, issue_id, reason)
+              else
+                allow_continuation(state, issue_id, refreshed_issue)
+              end
+          end
         else
           deny_continuation(state, issue_id, :issue_not_active)
         end
@@ -1439,6 +1429,25 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         deny_continuation(state, issue_id, {:issue_state_refresh_failed, reason})
     end
+  end
+
+  defp allow_continuation(%State{} = state, issue_id, %Issue{} = refreshed_issue) do
+    state =
+      state
+      |> update_running_issue_if_present(refreshed_issue)
+      |> then(fn updated_state ->
+        mode = ledger_mode_for_issue(updated_state.guardrail_ledger, issue_id)
+
+        update_guardrail_ledger(updated_state, issue_id, fn entry ->
+          entry
+          |> Map.put(:stop_reason, nil)
+          |> Map.put(:last_continuation_decision, {:allow, mode})
+          |> Map.put(:last_turn_started_at, DateTime.utc_now())
+        end)
+      end)
+
+    mode = ledger_mode_for_issue(state.guardrail_ledger, issue_id)
+    {{:allow, mode, refreshed_issue}, state}
   end
 
   defp update_running_issue_if_present(%State{} = state, %Issue{} = issue) do
@@ -1581,12 +1590,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_apply_realtime_guardrail_stop(%State{} = state, issue_id) do
-    case evaluate_realtime_guardrail_reason(state, issue_id) do
-      nil ->
+    cond do
+      guardrail_hold_active?(state, issue_id) ->
         state
 
-      reason ->
-        maybe_apply_guardrail_result(state, issue_id, reason, :realtime)
+      true ->
+        case evaluate_realtime_guardrail_reason(state, issue_id) do
+          nil ->
+            state
+
+          reason ->
+            maybe_apply_guardrail_result(state, issue_id, reason, :realtime)
+        end
     end
   end
 
@@ -1647,24 +1662,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_apply_guardrail_result(%State{} = state, issue_id, reason, trigger) do
-    state =
-      update_guardrail_ledger(state, issue_id, fn entry ->
-        entry
-        |> Map.put(:last_guardrail_reason, reason)
-        |> Map.put(:last_warning_at, DateTime.utc_now())
-      end)
-
     case Config.guardrails_mode() do
       "observe" ->
-        Logger.warning("Observed guardrail hit issue_id=#{issue_id} trigger=#{trigger} reason=#{inspect(reason)}")
-        state
+        if guardrail_warning_cooldown_active?(state, issue_id, reason) do
+          state
+        else
+          state =
+            update_guardrail_ledger(state, issue_id, fn entry ->
+              entry
+              |> Map.put(:last_guardrail_reason, reason)
+              |> Map.put(:last_warning_at, DateTime.utc_now())
+            end)
+
+          Logger.warning("Observed guardrail hit issue_id=#{issue_id} trigger=#{trigger} reason=#{inspect(reason)}")
+          state
+        end
 
       "enforce" ->
-        Logger.warning("Enforcing guardrail stop issue_id=#{issue_id} trigger=#{trigger} reason=#{inspect(reason)}")
-        apply_guardrail_stop(state, issue_id, reason, trigger)
+        if guardrail_hold_active?(state, issue_id) do
+          state
+        else
+          state =
+            update_guardrail_ledger(state, issue_id, fn entry ->
+              entry
+              |> Map.put(:last_guardrail_reason, reason)
+              |> Map.put(:last_warning_at, DateTime.utc_now())
+            end)
+
+          Logger.warning("Enforcing guardrail stop issue_id=#{issue_id} trigger=#{trigger} reason=#{inspect(reason)}")
+          apply_guardrail_stop(state, issue_id, reason, trigger)
+        end
 
       _ ->
         state
+    end
+  end
+
+  defp guardrail_warning_cooldown_active?(%State{} = state, issue_id, reason) do
+    case Map.get(state.guardrail_ledger, issue_id) do
+      %{last_guardrail_reason: ^reason, last_warning_at: %DateTime{} = last_warning_at} ->
+        DateTime.diff(DateTime.utc_now(), last_warning_at, :second) <
+          Config.guardrails_warning_cooldown_seconds()
+
+      _ ->
+        false
     end
   end
 

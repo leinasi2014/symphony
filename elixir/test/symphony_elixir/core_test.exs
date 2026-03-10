@@ -1471,11 +1471,35 @@ defmodule SymphonyElixir.CoreTest do
 
       Process.sleep(50)
       state = :sys.get_state(pid)
+      first_warning_at = get_in(Orchestrator.guardrail_ledger_for_test(state), [issue_id, :last_warning_at])
+
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "thread/tokenUsage/updated",
+             "params" => %{
+               "tokenUsage" => %{
+                 "total" => %{"input_tokens" => 12, "output_tokens" => 1, "total_tokens" => 13}
+               }
+             }
+           },
+           timestamp: DateTime.utc_now()
+         }}
+      )
+
+      Process.sleep(50)
+      state = :sys.get_state(pid)
       assert Process.alive?(worker_pid)
       assert Orchestrator.guardrail_holds_for_test(state) == %{}
 
       assert get_in(Orchestrator.guardrail_ledger_for_test(state), [issue_id, :last_guardrail_reason]) ==
                :hard_total_token_limit
+
+      assert get_in(Orchestrator.guardrail_ledger_for_test(state), [issue_id, :last_warning_at]) ==
+               first_warning_at
     after
       File.rm_rf(workspace_root)
     end
@@ -1566,9 +1590,28 @@ defmodule SymphonyElixir.CoreTest do
          }}
       )
 
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "thread/tokenUsage/updated",
+             "params" => %{
+               "tokenUsage" => %{
+                 "total" => %{"input_tokens" => 12, "output_tokens" => 1, "total_tokens" => 13}
+               }
+             }
+           },
+           timestamp: DateTime.utc_now()
+         }}
+      )
+
       assert_receive {:memory_tracker_comment, ^issue_id, body}, 1_000
       assert body =~ "hard_total_token_limit"
+      refute_receive {:memory_tracker_comment, ^issue_id, _}, 200
       assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 1_000
+      refute_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 200
 
       Process.sleep(100)
       state = :sys.get_state(pid)
@@ -1739,6 +1782,80 @@ defmodule SymphonyElixir.CoreTest do
       assert_receive {:memory_tracker_state_update, "issue-total-turn-limit", "Human Review"}, 1_000
       state = :sys.get_state(pid)
       assert Map.has_key?(Orchestrator.guardrail_holds_for_test(state), issue.id)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "turn-boundary does not stop an issue that is already non-active after refresh" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "guardrail-non-active-#{System.unique_integer([:positive])}")
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        agent_guardrails: %{
+          enabled: true,
+          mode: "enforce",
+          stop_state: "Human Review",
+          probe: %{
+            max_total_turns_per_issue: 1,
+            hard_total_tokens: 100,
+            hard_input_tokens: 100,
+            soft_total_tokens: 50,
+            soft_input_tokens: 50
+          }
+        }
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :TotalTurnNonActiveOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      issue = %Issue{
+        id: "issue-total-turn-done",
+        identifier: "MT-821-DONE",
+        title: "Total turn ceiling but already done",
+        description: "Done issues should not be moved back to Human Review",
+        state: "In Progress"
+      }
+
+      running_entry = %{
+        pid: self(),
+        ref: make_ref(),
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "thread-total-turn-done",
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        started_at: DateTime.utc_now()
+      }
+
+      initial_state = :sys.get_state(pid)
+
+      :sys.replace_state(pid, fn _ ->
+        %{initial_state | running: %{issue.id => running_entry}, claimed: MapSet.new([issue.id])}
+      end)
+
+      assert {:deny, :issue_not_active} =
+               Orchestrator.request_continuation_for_test(pid, issue.id, 1, fn [_issue_id] ->
+                 {:ok, [%{issue | state: "Done"}]}
+               end)
+
+      refute_receive {:memory_tracker_comment, "issue-total-turn-done", _}, 200
+      refute_receive {:memory_tracker_state_update, "issue-total-turn-done", _}, 200
+
+      state = :sys.get_state(pid)
+      refute Map.has_key?(Orchestrator.guardrail_holds_for_test(state), issue.id)
     after
       File.rm_rf(workspace_root)
     end
